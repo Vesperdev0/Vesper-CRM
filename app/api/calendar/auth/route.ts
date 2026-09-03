@@ -1,0 +1,2 @@
+import {NextResponse} from 'next/server'; import {getServerSupabase} from '../../../../lib/server'; import {googleAuthUrl} from '../../../../lib/google';
+export async function GET(){const sup=await getServerSupabase();const {data:{user}}=await sup.auth.getUser();if(!user)return NextResponse.redirect(new URL('/',process.env.NEXT_PUBLIC_APP_URL||'http://localhost:3000'));return NextResponse.redirect(googleAuthUrl(user.id))}
