@@ -126,6 +126,14 @@ create table if not exists audit_log (
  created_at timestamptz not null default now()
 );
 
+-- Outreach touch tracking as a per-company field, not separate pipeline stages — the
+-- Outreach SOP is explicit that DM/call touches stay as state on the "Prospect" stage, not
+-- their own kanban columns. Corrects the earlier design where Cold DM Reply/No Reply/Cold
+-- Call/Cold Call Failed were columns in `stages` below (Atomeo flagged this 2026-09-07).
+alter table companies add column if not exists outreach_status text
+  check (outreach_status in ('Not Contacted','DM Reply','DM No Reply','Call Successful','Call Failed'))
+  default 'Not Contacted';
+
 -- Post-close delivery tracking + retainer goals — additive only, does not touch the
 -- existing sales-pipeline `lead_status` list. Matches the real post-payment stages confirmed
 -- against Vesper's own Onboarding/Execution/Handover/Retainer SOPs (2026-09-07).

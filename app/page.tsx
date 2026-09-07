@@ -8,7 +8,10 @@ import {
 } from 'lucide-react'
 import { startOfWeek, addDays, addWeeks, format, isSameDay } from 'date-fns'
 
-const stages = ['Prospect','Cold DM Reply','Cold DM No Reply','Cold Call','Cold Call Failed','Qualified Lead','Discovery Call','Proposal Agreement Sent','Close Call','Verbal Approval','Agreement Signed','Initial Payment Received','Closed & Onboarding','Future Opportunity','Lost Opportunity']
+const stages = ['Prospect','Qualified Lead','Discovery Call','Proposal Agreement Sent','Close Call','Verbal Approval','Agreement Signed','Initial Payment Received','Closed & Onboarding','Future Opportunity','Lost Opportunity']
+// Outreach touches (DM/call) are a per-company field (see outreachStatuses below), not pipeline
+// columns — moved out of `stages` per the Outreach SOP and Atomeo's 2026-09-07 correction.
+const outreachStatuses = ['Not Contacted', 'DM Reply', 'DM No Reply', 'Call Successful', 'Call Failed']
 const siteOptions = ['No Site','Not Working','Outdated','Not Good','Coming Soon / Under Construction','Decent','Good']
 const clientTypes = ['old','not active','active','very active']
 const activityTypes = [
@@ -215,6 +218,20 @@ export default function Page() {
     if (updated && selected?.id === id) setSelected(updated)
   }
 
+  async function updateOutreachStatus(id: string, outreach_status: string) {
+    const current = companies.find(c => c.id === id)
+    const patch: any = { outreach_status }
+    // A successful cold call is what the Outreach SOP treats as the prospect becoming a real
+    // Qualified Lead, ready for the Sales SOP's Call 1 (Discovery) — NOT "Onboarding", which
+    // only happens 7 stages later, after the proposal is signed and paid. Only auto-advances
+    // out of Prospect, so it never overrides a stage someone already moved forward manually.
+    if (outreach_status === 'Call Successful' && current?.lead_status === 'Prospect') {
+      patch.lead_status = 'Qualified Lead'
+    }
+    const updated = await updateCompany(id, patch)
+    if (updated && selected?.id === id) setSelected(updated)
+  }
+
   async function updateProjectStage(id: string, project_stage: string) {
     const updated = await updateCompany(id, { project_stage: project_stage || null })
     if (updated && selected?.id === id) setSelected(updated)
@@ -417,8 +434,8 @@ export default function Page() {
         </header>
         <div className="content">
           {view === 'home' && <HomeView companies={companies} meetings={meetings} onOpen={(c: any) => { setSelected(c); setView('detail') }} onNew={() => setShowNew(true)} onGoCalendar={() => setView('calendar')} />}
-          {view === 'pipeline' && <Pipeline companies={filtered} onOpen={(c: any) => { setSelected(c); setView('detail') }} onUpdate={handleStageChange} />}
-          {view === 'companies' && <Companies companies={filtered} onOpen={(c: any) => { setSelected(c); setView('detail') }} onNew={() => setShowNew(true)} />}
+          {view === 'pipeline' && <Pipeline companies={filtered} onOpen={(c: any) => { setSelected(c); setView('detail') }} onUpdate={handleStageChange} onOutreachChange={updateOutreachStatus} />}
+          {view === 'companies' && <Companies companies={filtered} onOpen={(c: any) => { setSelected(c); setView('detail') }} onNew={() => setShowNew(true)} onOutreachChange={updateOutreachStatus} />}
           {view === 'calendar' && <CalendarView meetings={meetings} googleConn={googleConn} onSync={syncGoogleCalendar} />}
           {view === 'tasks' && <Tasks tasks={tasks} companies={companies} onToggle={toggleTask} onAdd={addTask} />}
           {view === 'settings' && <SettingsView googleConn={googleConn} />}
@@ -433,6 +450,7 @@ export default function Page() {
               onScheduleMeeting={(c: any) => setShowMeeting(c)}
               onSaveNotes={handleSaveNotes}
               deleting={deletingId === selected.id}
+              onOutreachChange={updateOutreachStatus}
               onProjectStageChange={updateProjectStage}
               onRetainerTierChange={updateRetainerTier}
               onAddMilestone={addMilestone}
@@ -539,7 +557,7 @@ function Attention({ icon, title, text, onClick }: { icon: any; title: string; t
 function Empty({ title, text }: { title: string; text: string }) { return <div className="empty"><b>{title}</b><p>{text}</p></div> }
 function Status({ s }: { s: string }) { return <span className={'status ' + s.toLowerCase().replaceAll(' ', '-')}>{s}</span> }
 
-function Pipeline({ companies, onOpen, onUpdate }: { companies: any[]; onOpen: any; onUpdate: any }) {
+function Pipeline({ companies, onOpen, onUpdate, onOutreachChange }: { companies: any[]; onOpen: any; onUpdate: any; onOutreachChange: any }) {
   const [dragId, setDragId] = useState<string | null>(null)
   return (
     <>
@@ -552,6 +570,14 @@ function Pipeline({ companies, onOpen, onUpdate }: { companies: any[]; onOpen: a
               <div className="deal-card" key={c.id} draggable onDragStart={() => setDragId(c.id)} onDragEnd={() => setDragId(null)} onClick={() => onOpen(c)}>
                 <div className="card-top"><b>{c.name}</b><span>{c.lead_score}</span></div>
                 <p>{c.contact?.name || 'Decision maker'}</p>
+                <select
+                  className="outreach-select"
+                  value={c.outreach_status || 'Not Contacted'}
+                  onClick={e => e.stopPropagation()}
+                  onChange={e => onOutreachChange(c.id, e.target.value)}
+                >
+                  {outreachStatuses.map(s => <option key={s} value={s}>{s}</option>)}
+                </select>
                 <div className="card-bottom"><span>{money(c.deal_value)}</span><span>{c.site_condition}</span></div>
               </div>
             ))}
@@ -562,7 +588,7 @@ function Pipeline({ companies, onOpen, onUpdate }: { companies: any[]; onOpen: a
   )
 }
 
-function Companies({ companies, onOpen, onNew }: { companies: any[]; onOpen: any; onNew: any }) {
+function Companies({ companies, onOpen, onNew, onOutreachChange }: { companies: any[]; onOpen: any; onNew: any; onOutreachChange: any }) {
   const [filter, setFilter] = useState<'all' | 'qualified' | 'active'>('all')
   const shown = companies.filter(c => (filter === 'all' ? true : filter === 'qualified' ? c.lead_status === 'Qualified Lead' : c.client_type === 'active'))
   return (
@@ -584,6 +610,15 @@ function Companies({ companies, onOpen, onNew }: { companies: any[]; onOpen: any
               <div className="cc-title"><h3>{c.name}</h3><Status s={c.lead_status} /></div>
               <p>{c.contact?.name || 'No decision maker'} · {c.website || 'No website'}</p>
               <div className="chips"><span>Score {c.lead_score}</span><span>{c.site_condition}</span><span>{c.gbp ? 'GBP' : 'No GBP'}</span></div>
+              <select
+                className="outreach-select"
+                style={{ marginTop: 8, width: 'auto' }}
+                value={c.outreach_status || 'Not Contacted'}
+                onClick={e => e.stopPropagation()}
+                onChange={e => onOutreachChange(c.id, e.target.value)}
+              >
+                {outreachStatuses.map(s => <option key={s} value={s}>{s}</option>)}
+              </select>
             </div>
             <div className="cc-value"><span>Deal value</span><b>{money(c.deal_value)}</b></div>
             <ChevronRight />
@@ -594,7 +629,7 @@ function Companies({ companies, onOpen, onNew }: { companies: any[]; onOpen: any
   )
 }
 
-function Detail({ c, onBack, onUpdate, onEdit, onDelete, onAddActivity, onScheduleMeeting, onSaveNotes, deleting, onProjectStageChange, onRetainerTierChange, onAddMilestone, onToggleMilestone, onApplyTemplate }: { c: any; onBack: any; onUpdate: any; onEdit: any; onDelete: any; onAddActivity: any; onScheduleMeeting: any; onSaveNotes: any; deleting?: boolean; onProjectStageChange: any; onRetainerTierChange: any; onAddMilestone: any; onToggleMilestone: any; onApplyTemplate: any }) {
+function Detail({ c, onBack, onUpdate, onEdit, onDelete, onAddActivity, onScheduleMeeting, onSaveNotes, deleting, onOutreachChange, onProjectStageChange, onRetainerTierChange, onAddMilestone, onToggleMilestone, onApplyTemplate }: { c: any; onBack: any; onUpdate: any; onEdit: any; onDelete: any; onAddActivity: any; onScheduleMeeting: any; onSaveNotes: any; deleting?: boolean; onOutreachChange: any; onProjectStageChange: any; onRetainerTierChange: any; onAddMilestone: any; onToggleMilestone: any; onApplyTemplate: any }) {
   const [tab, setTab] = useState('overview')
   const [notes, setNotes] = useState(c.remarks || '')
   useEffect(() => { setNotes(c.remarks || '') }, [c.id])
@@ -631,6 +666,13 @@ function Detail({ c, onBack, onUpdate, onEdit, onDelete, onAddActivity, onSchedu
         <div className="detail-grid">
           <section className="panel">
             <div className="panel-head"><h2>Company</h2></div>
+            <div className="form-grid" style={{ gridTemplateColumns: '1fr', padding: 0, marginBottom: 14 }}>
+              <label>Outreach status
+                <select value={c.outreach_status || 'Not Contacted'} onChange={e => onOutreachChange(c.id, e.target.value)}>
+                  {outreachStatuses.map(s => <option key={s} value={s}>{s}</option>)}
+                </select>
+              </label>
+            </div>
             <Info label="Lead status" value={c.lead_status} /><Info label="Lead score" value={`${c.lead_score}/100`} /><Info label="Website condition" value={c.site_condition} /><Info label="GBP" value={c.gbp ? 'Yes' : 'No'} /><Info label="Deal value" value={money(c.deal_value)} /><Info label="Client type" value={c.client_type} /><Info label="Email" value={c.company_email} /><Info label="Phone" value={c.company_phone} /><Info label="Address" value={c.address} /><Info label="Remarks" value={c.remarks} />
           </section>
           <section className="panel">
