@@ -349,7 +349,7 @@ export default function Page() {
       <main>
         <header>
           <div className="mobile-brand" onClick={() => setView('home')} style={{ cursor: 'pointer' }}>VESPER</div>
-          <div className="search"><Search /><input ref={searchRef} value={q} onChange={e => setQ(e.target.value)} placeholder="Search companies, people, notes..." /><kbd>⌘ K</kbd></div>
+          <div className="search" style={view === 'home' ? { visibility: 'hidden', pointerEvents: 'none' } : undefined}><Search /><input ref={searchRef} value={q} onChange={e => setQ(e.target.value)} placeholder="Search companies, people, notes..." disabled={view === 'home'} /><kbd>⌘ K</kbd></div>
           <div className="header-actions">
             <button onClick={() => setDark(!dark)} className="icon-btn">{dark ? <Sun /> : <Moon />}</button>
             <button className="primary" onClick={() => setShowNew(true)}><Plus /> New company</button>
