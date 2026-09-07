@@ -19,6 +19,30 @@ const activityTypes = [
   { value: 'note', label: 'Note' },
 ]
 
+// Real post-payment delivery stages, confirmed against Vesper's own Onboarding / Execution &
+// Revision / Handover / Retainer SOPs — not invented. Deliberately separate from `stages`
+// (the sales pipeline) rather than replacing "Closed & Onboarding": that keeps this additive,
+// with no migration needed for existing companies.
+const projectStages = ['Onboarding', 'Active Project', 'Waiting on Client', 'Ready for Launch', 'Won Opportunity / Active Retainer']
+const retainerTiers = ['maintenance', 'growth', 'full-service']
+// Standard recurring goals per tier, taken directly from the Retainer SOP's tier tables —
+// Maintenance has no SOP-mandated recurring deliverable beyond the update allowance itself.
+const retainerGoalTemplates: Record<string, { title: string; cadence: string }[]> = {
+  maintenance: [],
+  growth: [
+    { title: 'Monthly report (GA4 + GBP)', cadence: 'monthly' },
+    { title: 'GBP weekly post', cadence: 'weekly' },
+    { title: 'Keyword tracking (5 keywords)', cadence: 'monthly' },
+  ],
+  'full-service': [
+    { title: 'Monthly report (rank + performance)', cadence: 'monthly' },
+    { title: 'GBP weekly post', cadence: 'weekly' },
+    { title: 'Keyword tracking (15 keywords) + citation building', cadence: 'monthly' },
+    { title: 'Quarterly page refresh', cadence: 'quarterly' },
+    { title: 'Monthly blog / case-study post', cadence: 'monthly' },
+  ],
+}
+
 function money(n: number | null) {
   return n == null ? '—' : new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 }).format(n)
 }
@@ -70,7 +94,7 @@ export default function Page() {
 
   async function loadAll() {
     const [{ data: comp }, { data: tk }] = await Promise.all([
-      supabase.from('companies').select('*,contacts(*),activities(*)').order('updated_at', { ascending: false }),
+      supabase.from('companies').select('*,contacts(*),activities(*),milestones(*)').order('updated_at', { ascending: false }),
       supabase.from('tasks').select('*,companies(name)').order('due_at', { ascending: true, nullsFirst: false }),
     ])
     setCompanies((comp || []).map((x: any) => ({ ...x, contact: x.contacts?.[0] || null })))
@@ -171,12 +195,12 @@ export default function Page() {
       contact = ct
     }
     await supabase.from('activities').insert({ company_id: row.id, user_id: auth.user?.id, type: 'system', title: 'Prospect added' })
-    setCompanies(x => [{ ...row, contact, activities: [{ title: 'Prospect added', type: 'system', occurred_at: new Date().toISOString() }] }, ...x])
+    setCompanies(x => [{ ...row, contact, activities: [{ title: 'Prospect added', type: 'system', occurred_at: new Date().toISOString() }], milestones: [] }, ...x])
     setShowNew(false); setView('companies')
   }
 
   async function updateCompany(id: string, patch: any) {
-    const { data, error } = await supabase.from('companies').update(patch).eq('id', id).select('*,contacts(*),activities(*)').single()
+    const { data, error } = await supabase.from('companies').update(patch).eq('id', id).select('*,contacts(*),activities(*),milestones(*)').single()
     if (error) { alert(error.message); return null }
     const updated = { ...data, contact: data.contacts?.[0] || null }
     setCompanies(x => x.map(z => (z.id === id ? updated : z)))
@@ -191,8 +215,42 @@ export default function Page() {
     if (updated && selected?.id === id) setSelected(updated)
   }
 
+  async function updateProjectStage(id: string, project_stage: string) {
+    const updated = await updateCompany(id, { project_stage: project_stage || null })
+    if (updated && selected?.id === id) setSelected(updated)
+  }
+  async function updateRetainerTier(id: string, retainer_tier: string) {
+    const updated = await updateCompany(id, { retainer_tier: retainer_tier || null })
+    if (updated && selected?.id === id) setSelected(updated)
+  }
+  function patchMilestonesLocally(companyId: string, fn: (ms: any[]) => any[]) {
+    setCompanies(x => x.map(c => (c.id === companyId ? { ...c, milestones: fn(c.milestones || []) } : c)))
+    setSelected((s: any) => (s && s.id === companyId ? { ...s, milestones: fn(s.milestones || []) } : s))
+  }
+  async function addMilestone(company: any, m: { title: string; cadence?: string }) {
+    const { data, error } = await supabase.from('milestones').insert({
+      company_id: company.id, title: m.title, cadence: m.cadence || 'once', category: 'goal',
+    }).select().single()
+    if (error) { alert(error.message); return }
+    patchMilestonesLocally(company.id, ms => [...ms, data])
+  }
+  async function toggleMilestone(companyId: string, milestoneId: string, status: string) {
+    const { error } = await supabase.from('milestones').update({ status }).eq('id', milestoneId)
+    if (error) { alert(error.message); return }
+    patchMilestonesLocally(companyId, ms => ms.map(m => (m.id === milestoneId ? { ...m, status } : m)))
+  }
+  async function applyRetainerTemplate(company: any, tier: string) {
+    const template = retainerGoalTemplates[tier] || []
+    if (!template.length) return
+    const { data, error } = await supabase.from('milestones').insert(
+      template.map(t => ({ company_id: company.id, title: t.title, cadence: t.cadence, category: 'goal' }))
+    ).select()
+    if (error) { alert(error.message); return }
+    patchMilestonesLocally(company.id, ms => [...ms, ...(data || [])])
+  }
+
   async function refetchCompany(id: string, alsoSelect = false) {
-    const { data, error } = await supabase.from('companies').select('*,contacts(*),activities(*)').eq('id', id).single()
+    const { data, error } = await supabase.from('companies').select('*,contacts(*),activities(*),milestones(*)').eq('id', id).single()
     if (error) { alert(error.message); return null }
     const updated = { ...data, contact: data.contacts?.[0] || null }
     setCompanies(x => x.map(z => (z.id === id ? updated : z)))
@@ -375,6 +433,11 @@ export default function Page() {
               onScheduleMeeting={(c: any) => setShowMeeting(c)}
               onSaveNotes={handleSaveNotes}
               deleting={deletingId === selected.id}
+              onProjectStageChange={updateProjectStage}
+              onRetainerTierChange={updateRetainerTier}
+              onAddMilestone={addMilestone}
+              onToggleMilestone={toggleMilestone}
+              onApplyTemplate={applyRetainerTemplate}
             />
           )}
         </div>
@@ -531,7 +594,7 @@ function Companies({ companies, onOpen, onNew }: { companies: any[]; onOpen: any
   )
 }
 
-function Detail({ c, onBack, onUpdate, onEdit, onDelete, onAddActivity, onScheduleMeeting, onSaveNotes, deleting }: { c: any; onBack: any; onUpdate: any; onEdit: any; onDelete: any; onAddActivity: any; onScheduleMeeting: any; onSaveNotes: any; deleting?: boolean }) {
+function Detail({ c, onBack, onUpdate, onEdit, onDelete, onAddActivity, onScheduleMeeting, onSaveNotes, deleting, onProjectStageChange, onRetainerTierChange, onAddMilestone, onToggleMilestone, onApplyTemplate }: { c: any; onBack: any; onUpdate: any; onEdit: any; onDelete: any; onAddActivity: any; onScheduleMeeting: any; onSaveNotes: any; deleting?: boolean; onProjectStageChange: any; onRetainerTierChange: any; onAddMilestone: any; onToggleMilestone: any; onApplyTemplate: any }) {
   const [tab, setTab] = useState('overview')
   const [notes, setNotes] = useState(c.remarks || '')
   useEffect(() => { setNotes(c.remarks || '') }, [c.id])
@@ -561,6 +624,7 @@ function Detail({ c, onBack, onUpdate, onEdit, onDelete, onAddActivity, onSchedu
       <div className="tabs">
         <button className={tab === 'overview' ? 'active' : ''} onClick={() => setTab('overview')}>Overview</button>
         <button className={tab === 'activity' ? 'active' : ''} onClick={() => setTab('activity')}>Activity</button>
+        <button className={tab === 'project' ? 'active' : ''} onClick={() => setTab('project')}>Project</button>
         <button className={tab === 'notes' ? 'active' : ''} onClick={() => setTab('notes')}>Notes</button>
       </div>
       {tab === 'overview' ? (
@@ -584,6 +648,15 @@ function Detail({ c, onBack, onUpdate, onEdit, onDelete, onAddActivity, onSchedu
             </div>
           )) : <Empty title="No activity yet" text="Log a call, email or DM with the Activity button above." />}
         </section>
+      ) : tab === 'project' ? (
+        <ProjectPanel
+          c={c}
+          onStageChange={onProjectStageChange}
+          onTierChange={onRetainerTierChange}
+          onAddMilestone={onAddMilestone}
+          onToggleMilestone={onToggleMilestone}
+          onApplyTemplate={onApplyTemplate}
+        />
       ) : (
         <section className="panel">
           <div className="panel-head"><h2>Notes</h2><button className="text-btn" onClick={() => onSaveNotes(c.id, notes)}><Save /> Save</button></div>
@@ -594,6 +667,73 @@ function Detail({ c, onBack, onUpdate, onEdit, onDelete, onAddActivity, onSchedu
   )
 }
 function Info({ label, value }: { label: string; value: any }) { return <div className="info"><span>{label}</span><b>{value || '—'}</b></div> }
+
+function ProjectPanel({ c, onStageChange, onTierChange, onAddMilestone, onToggleMilestone, onApplyTemplate }: { c: any; onStageChange: (id: string, stage: string) => void; onTierChange: (id: string, tier: string) => void; onAddMilestone: (c: any, m: any) => void; onToggleMilestone: (companyId: string, milestoneId: string, status: string) => void; onApplyTemplate: (c: any, tier: string) => void }) {
+  const [title, setTitle] = useState('')
+  const [cadence, setCadence] = useState('once')
+  const milestones = c.milestones || []
+  const open = milestones.filter((m: any) => m.status !== 'done')
+  const done = milestones.filter((m: any) => m.status === 'done')
+  function submit(e: React.FormEvent) {
+    e.preventDefault()
+    if (!title.trim()) return
+    onAddMilestone(c, { title: title.trim(), cadence })
+    setTitle('')
+  }
+  return (
+    <div className="detail-grid">
+      <section className="panel">
+        <div className="panel-head"><h2>Delivery stage</h2></div>
+        <div className="form-grid" style={{ gridTemplateColumns: '1fr', padding: 0 }}>
+          <label>Stage (post-close)
+            <select value={c.project_stage || ''} onChange={e => onStageChange(c.id, e.target.value)}>
+              <option value="">— not started —</option>
+              {projectStages.map(s => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </label>
+        </div>
+        <div className="panel-head" style={{ marginTop: 22 }}><h2>Retainer tier</h2></div>
+        <div className="form-grid" style={{ gridTemplateColumns: '1fr', padding: 0 }}>
+          <label>Tier
+            <select value={c.retainer_tier || ''} onChange={e => onTierChange(c.id, e.target.value)}>
+              <option value="">— none —</option>
+              {retainerTiers.map(t => <option key={t} value={t}>{t}</option>)}
+            </select>
+          </label>
+        </div>
+        {c.retainer_tier && retainerGoalTemplates[c.retainer_tier]?.length > 0 && (
+          <button className="text-btn" style={{ marginTop: 12 }} onClick={() => onApplyTemplate(c, c.retainer_tier)}>
+            <Plus /> Add {c.retainer_tier}'s standard goals
+          </button>
+        )}
+      </section>
+      <section className="panel">
+        <div className="panel-head"><h2>Goals & deliverables</h2></div>
+        <form onSubmit={submit} className="form-grid" style={{ gridTemplateColumns: '2fr 1fr', padding: 0, marginBottom: 14 }}>
+          <label>Goal<input value={title} onChange={e => setTitle(e.target.value)} placeholder="e.g. Monthly report" /></label>
+          <label>Cadence
+            <select value={cadence} onChange={e => setCadence(e.target.value)}>
+              <option value="once">Once</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option><option value="quarterly">Quarterly</option>
+            </select>
+          </label>
+          <div style={{ gridColumn: '1 / -1' }}><button className="primary" type="submit"><Plus /> Add goal</button></div>
+        </form>
+        {open.length ? open.map((m: any) => (
+          <div className="task" key={m.id}>
+            <button className="check" onClick={() => onToggleMilestone(c.id, m.id, 'done')}><span /></button>
+            <div><b>{m.title}</b><p>{m.cadence}</p></div>
+          </div>
+        )) : <Empty title="No goals yet" text="Add one above, or apply the retainer tier's standard goals." />}
+        {done.map((m: any) => (
+          <div className="task" key={m.id} style={{ opacity: 0.5 }}>
+            <button className="check" onClick={() => onToggleMilestone(c.id, m.id, 'pending')}><CheckCircle2 /></button>
+            <div><b style={{ textDecoration: 'line-through' }}>{m.title}</b><p>{m.cadence}</p></div>
+          </div>
+        ))}
+      </section>
+    </div>
+  )
+}
 
 function CalendarView({ meetings, googleConn, onSync }: { meetings: any[]; googleConn: any; onSync: (manual?: boolean) => void | Promise<void> }) {
   const [weekStart, setWeekStart] = useState<Date>(() => startOfWeek(new Date(), { weekStartsOn: 1 }))

@@ -126,6 +126,29 @@ create table if not exists audit_log (
  created_at timestamptz not null default now()
 );
 
+-- Post-close delivery tracking + retainer goals — additive only, does not touch the
+-- existing sales-pipeline `lead_status` list. Matches the real post-payment stages confirmed
+-- against Vesper's own Onboarding/Execution/Handover/Retainer SOPs (2026-09-07).
+alter table companies add column if not exists project_stage text
+  check (project_stage in ('Onboarding','Active Project','Waiting on Client','Ready for Launch','Won Opportunity / Active Retainer'));
+alter table companies add column if not exists retainer_tier text
+  check (retainer_tier in ('maintenance','growth','full-service'));
+
+create table if not exists milestones (
+ id uuid primary key default gen_random_uuid(),
+ company_id uuid not null references companies(id) on delete cascade,
+ title text not null,
+ category text not null default 'goal' check (category in ('goal','deliverable')),
+ cadence text check (cadence in ('once','weekly','monthly','quarterly')),
+ target_date timestamptz,
+ status text not null default 'pending' check (status in ('pending','done','missed')),
+ created_at timestamptz not null default now(),
+ updated_at timestamptz not null default now()
+);
+alter table milestones enable row level security;
+create policy "authenticated milestones" on milestones for all to authenticated using (true) with check (true);
+create or replace trigger milestones_updated before update on milestones for each row execute function set_updated_at();
+
 alter table profiles enable row level security;
 alter table companies enable row level security;
 alter table contacts enable row level security;
