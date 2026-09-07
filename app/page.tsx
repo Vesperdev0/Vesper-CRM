@@ -226,9 +226,22 @@ export default function Page() {
 
   async function deleteCompany(id: string) {
     if (!confirm('Delete this company? This cannot be undone.')) return
+    // Cancel the Google Calendar event for every meeting this company has, BEFORE deleting the
+    // company. Otherwise: the DB cascade-deletes the local `meetings` rows, the Google event is
+    // left dangling, and the next calendar sync re-imports it as a new, company-less meeting —
+    // the deleted data quietly comes back. Best-effort: if a delete call fails (e.g. an expired
+    // token), we still proceed with deleting the company rather than blocking on Google's API.
+    const linkedMeetings = meetings.filter(m => m.company_id === id && m.google_event_id)
+    for (const m of linkedMeetings) {
+      try {
+        await fetch(`/api/calendar/events?eventId=${encodeURIComponent(m.google_event_id)}`, { method: 'DELETE' })
+      } catch {}
+    }
     const { error } = await supabase.from('companies').delete().eq('id', id)
     if (error) { alert(error.message); return }
-    setCompanies(x => x.filter(z => z.id !== id)); setSelected(null); setView('companies')
+    setCompanies(x => x.filter(z => z.id !== id))
+    setMeetings(x => x.filter(m => m.company_id !== id))
+    setSelected(null); setView('companies')
   }
 
   async function addActivity(company: any, a: { type: string; title: string; body?: string }) {
