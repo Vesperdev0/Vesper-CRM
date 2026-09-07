@@ -333,7 +333,7 @@ export default function Page() {
   return (
     <div className={dark ? 'app dark' : 'app'}>
       <aside>
-        <div className="side-brand"><div className="mini-logo">V</div><b>VESPER</b></div>
+        <div className="side-brand" onClick={() => setView('home')} style={{ cursor: 'pointer' }}><div className="mini-logo">V</div><b>VESPER</b></div>
         <nav>
           <Nav active={view === 'home'} icon={<Home />} label="Today" onClick={() => setView('home')} />
           <Nav active={view === 'pipeline'} icon={<Kanban />} label="Pipeline" onClick={() => setView('pipeline')} />
@@ -348,12 +348,13 @@ export default function Page() {
       </aside>
       <main>
         <header>
-          <div className="mobile-brand">VESPER</div>
+          <div className="mobile-brand" onClick={() => setView('home')} style={{ cursor: 'pointer' }}>VESPER</div>
           <div className="search"><Search /><input ref={searchRef} value={q} onChange={e => setQ(e.target.value)} placeholder="Search companies, people, notes..." /><kbd>⌘ K</kbd></div>
           <div className="header-actions">
             <button onClick={() => setDark(!dark)} className="icon-btn">{dark ? <Sun /> : <Moon />}</button>
             <button className="primary" onClick={() => setShowNew(true)}><Plus /> New company</button>
-            <div className="avatar">{initials(user.user_metadata?.display_name || user.email || 'V')}</div>
+            <button className="icon-btn mobile-logout" onClick={logout} title="Sign out"><LogOut /></button>
+            <div className="avatar" onClick={() => setView('settings')} style={{ cursor: 'pointer' }} title="Settings">{initials(user.user_metadata?.display_name || user.email || 'V')}</div>
           </div>
         </header>
         <div className="content">
@@ -378,6 +379,13 @@ export default function Page() {
           )}
         </div>
       </main>
+      <nav className="bottom-nav">
+        <Nav active={view === 'home'} icon={<Home />} label="Today" onClick={() => setView('home')} />
+        <Nav active={view === 'pipeline'} icon={<Kanban />} label="Pipeline" onClick={() => setView('pipeline')} />
+        <Nav active={view === 'companies'} icon={<Users />} label="Companies" onClick={() => setView('companies')} />
+        <Nav active={view === 'calendar'} icon={<Calendar />} label="Calendar" onClick={() => setView('calendar')} />
+        <Nav active={view === 'tasks'} icon={<CheckCircle2 />} label="Tasks" onClick={() => setView('tasks')} />
+      </nav>
       <button className="ai-fab" onClick={() => { const v = prompt('Ask VESPER anything about your CRM'); if (v) { setAi(v); setTimeout(runAI, 0); setView('companies') } }}><Command /></button>
       {showNew && <CompanyForm onClose={() => setShowNew(false)} onSave={addCompany} />}
       {editCompany && <CompanyForm initial={editCompany} onClose={() => setEditCompany(null)} onSave={(f: any) => saveEditedCompany(editCompany.id, f)} />}
