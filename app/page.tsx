@@ -259,12 +259,23 @@ export default function Page() {
     setCompanies(x => x.map(c => (c.id === companyId ? { ...c, milestones: fn(c.milestones || []) } : c)))
     setSelected((s: any) => (s && s.id === companyId ? { ...s, milestones: fn(s.milestones || []) } : s))
   }
-  async function addMilestone(company: any, m: { title: string; cadence?: string }) {
+  async function addMilestone(company: any, m: { title: string; cadence?: string; priority?: string; target_date?: string; category?: string }) {
     const { data, error } = await supabase.from('milestones').insert({
-      company_id: company.id, title: m.title, cadence: m.cadence || 'once', category: 'goal',
+      company_id: company.id, title: m.title, cadence: m.cadence || 'once', category: m.category || 'goal',
+      priority: m.priority || 'Medium', target_date: m.target_date || null,
     }).select().single()
     if (error) { alert(error.message); return }
     patchMilestonesLocally(company.id, ms => [...ms, data])
+  }
+  async function updateMilestoneProgress(companyId: string, milestoneId: string, progress: number) {
+    patchMilestonesLocally(companyId, ms => ms.map(m => (m.id === milestoneId ? { ...m, progress } : m)))
+    const { error } = await supabase.from('milestones').update({ progress }).eq('id', milestoneId)
+    if (error) alert(error.message)
+  }
+  async function deleteMilestone(companyId: string, milestoneId: string) {
+    const { error } = await supabase.from('milestones').delete().eq('id', milestoneId)
+    if (error) { alert(error.message); return }
+    patchMilestonesLocally(companyId, ms => ms.filter(m => m.id !== milestoneId))
   }
   async function toggleMilestone(companyId: string, milestoneId: string, status: string) {
     const { error } = await supabase.from('milestones').update({ status }).eq('id', milestoneId)
@@ -471,6 +482,8 @@ export default function Page() {
               onAddMilestone={addMilestone}
               onToggleMilestone={toggleMilestone}
               onApplyTemplate={applyRetainerTemplate}
+              onUpdateMilestoneProgress={updateMilestoneProgress}
+              onDeleteMilestone={deleteMilestone}
             />
           )}
         </div>
@@ -644,7 +657,7 @@ function Companies({ companies, onOpen, onNew, onOutreachChange }: { companies: 
   )
 }
 
-function Detail({ c, onBack, onUpdate, onEdit, onDelete, onAddActivity, onScheduleMeeting, onSaveNotes, deleting, onOutreachChange, onProjectStageChange, onRetainerTierChange, onAddMilestone, onToggleMilestone, onApplyTemplate }: { c: any; onBack: any; onUpdate: any; onEdit: any; onDelete: any; onAddActivity: any; onScheduleMeeting: any; onSaveNotes: any; deleting?: boolean; onOutreachChange: any; onProjectStageChange: any; onRetainerTierChange: any; onAddMilestone: any; onToggleMilestone: any; onApplyTemplate: any }) {
+function Detail({ c, onBack, onUpdate, onEdit, onDelete, onAddActivity, onScheduleMeeting, onSaveNotes, deleting, onOutreachChange, onProjectStageChange, onRetainerTierChange, onAddMilestone, onToggleMilestone, onApplyTemplate, onUpdateMilestoneProgress, onDeleteMilestone }: { c: any; onBack: any; onUpdate: any; onEdit: any; onDelete: any; onAddActivity: any; onScheduleMeeting: any; onSaveNotes: any; deleting?: boolean; onOutreachChange: any; onProjectStageChange: any; onRetainerTierChange: any; onAddMilestone: any; onToggleMilestone: any; onApplyTemplate: any; onUpdateMilestoneProgress: any; onDeleteMilestone: any }) {
   const [tab, setTab] = useState('overview')
   const [notes, setNotes] = useState(c.remarks || '')
   useEffect(() => { setNotes(c.remarks || '') }, [c.id])
@@ -713,6 +726,8 @@ function Detail({ c, onBack, onUpdate, onEdit, onDelete, onAddActivity, onSchedu
           onAddMilestone={onAddMilestone}
           onToggleMilestone={onToggleMilestone}
           onApplyTemplate={onApplyTemplate}
+          onUpdateProgress={onUpdateMilestoneProgress}
+          onDeleteMilestone={onDeleteMilestone}
         />
       ) : (
         <section className="panel">
@@ -725,70 +740,114 @@ function Detail({ c, onBack, onUpdate, onEdit, onDelete, onAddActivity, onSchedu
 }
 function Info({ label, value }: { label: string; value: any }) { return <div className="info"><span>{label}</span><b>{value || '—'}</b></div> }
 
-function ProjectPanel({ c, onStageChange, onTierChange, onAddMilestone, onToggleMilestone, onApplyTemplate }: { c: any; onStageChange: (id: string, stage: string) => void; onTierChange: (id: string, tier: string) => void; onAddMilestone: (c: any, m: any) => void; onToggleMilestone: (companyId: string, milestoneId: string, status: string) => void; onApplyTemplate: (c: any, tier: string) => void }) {
+function ProjectPanel({ c, onStageChange, onTierChange, onAddMilestone, onToggleMilestone, onApplyTemplate, onUpdateProgress, onDeleteMilestone }: { c: any; onStageChange: (id: string, stage: string) => void; onTierChange: (id: string, tier: string) => void; onAddMilestone: (c: any, m: any) => void; onToggleMilestone: (companyId: string, milestoneId: string, status: string) => void; onApplyTemplate: (c: any, tier: string) => void; onUpdateProgress: (companyId: string, milestoneId: string, progress: number) => void; onDeleteMilestone: (companyId: string, milestoneId: string) => void }) {
   const [title, setTitle] = useState('')
   const [cadence, setCadence] = useState('once')
+  const [category, setCategory] = useState('goal')
+  const [priority, setPriority] = useState('Medium')
+  const [targetDate, setTargetDate] = useState('')
+  const [dragId, setDragId] = useState<string | null>(null)
   const milestones = c.milestones || []
-  const open = milestones.filter((m: any) => m.status !== 'done')
-  const done = milestones.filter((m: any) => m.status === 'done')
   function submit(e: React.FormEvent) {
     e.preventDefault()
     if (!title.trim()) return
-    onAddMilestone(c, { title: title.trim(), cadence })
-    setTitle('')
+    onAddMilestone(c, { title: title.trim(), cadence, category, priority, target_date: targetDate ? new Date(targetDate).toISOString() : undefined })
+    setTitle(''); setTargetDate('')
   }
+  const columns: { key: string; label: string }[] = [
+    { key: 'pending', label: 'Not started' },
+    { key: 'in_progress', label: 'In progress' },
+    { key: 'done', label: 'Done' },
+  ]
+  const bucketOf = (m: any) => (m.status === 'in_progress' ? 'in_progress' : m.status === 'done' ? 'done' : 'pending')
   return (
-    <div className="detail-grid">
-      <section className="panel">
-        <div className="panel-head"><h2>Delivery stage</h2></div>
-        <div className="form-grid" style={{ gridTemplateColumns: '1fr', padding: 0 }}>
-          <label>Stage (post-close)
-            <select value={c.project_stage || ''} onChange={e => onStageChange(c.id, e.target.value)}>
-              <option value="">— not started —</option>
-              {projectStages.map(s => <option key={s} value={s}>{s}</option>)}
-            </select>
-          </label>
-        </div>
-        <div className="panel-head" style={{ marginTop: 22 }}><h2>Retainer tier</h2></div>
-        <div className="form-grid" style={{ gridTemplateColumns: '1fr', padding: 0 }}>
-          <label>Tier
-            <select value={c.retainer_tier || ''} onChange={e => onTierChange(c.id, e.target.value)}>
-              <option value="">— none —</option>
-              {retainerTiers.map(t => <option key={t} value={t}>{t}</option>)}
-            </select>
-          </label>
-        </div>
-        {c.retainer_tier && retainerGoalTemplates[c.retainer_tier]?.length > 0 && (
-          <button className="text-btn" style={{ marginTop: 12 }} onClick={() => onApplyTemplate(c, c.retainer_tier)}>
-            <Plus /> Add {c.retainer_tier}'s standard goals
-          </button>
-        )}
-      </section>
-      <section className="panel">
-        <div className="panel-head"><h2>Goals & deliverables</h2></div>
-        <form onSubmit={submit} className="form-grid" style={{ gridTemplateColumns: '2fr 1fr', padding: 0, marginBottom: 14 }}>
-          <label>Goal<input value={title} onChange={e => setTitle(e.target.value)} placeholder="e.g. Monthly report" /></label>
-          <label>Cadence
-            <select value={cadence} onChange={e => setCadence(e.target.value)}>
-              <option value="once">Once</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option><option value="quarterly">Quarterly</option>
-            </select>
-          </label>
-          <div style={{ gridColumn: '1 / -1' }}><button className="primary" type="submit"><Plus /> Add goal</button></div>
-        </form>
-        {open.length ? open.map((m: any) => (
-          <div className="task" key={m.id}>
-            <button className="check" onClick={() => onToggleMilestone(c.id, m.id, 'done')}><span /></button>
-            <div><b>{m.title}</b><p>{m.cadence}</p></div>
+    <>
+      <div className="detail-grid">
+        <section className="panel">
+          <div className="panel-head"><h2>Delivery stage</h2></div>
+          <div className="form-grid" style={{ gridTemplateColumns: '1fr', padding: 0 }}>
+            <label>Stage (post-close)
+              <select value={c.project_stage || ''} onChange={e => onStageChange(c.id, e.target.value)}>
+                <option value="">— not started —</option>
+                {projectStages.map(s => <option key={s} value={s}>{s}</option>)}
+              </select>
+            </label>
           </div>
-        )) : <Empty title="No goals yet" text="Add one above, or apply the retainer tier's standard goals." />}
-        {done.map((m: any) => (
-          <div className="task" key={m.id} style={{ opacity: 0.5 }}>
-            <button className="check" onClick={() => onToggleMilestone(c.id, m.id, 'pending')}><CheckCircle2 /></button>
-            <div><b style={{ textDecoration: 'line-through' }}>{m.title}</b><p>{m.cadence}</p></div>
+          <div className="panel-head" style={{ marginTop: 22 }}><h2>Retainer tier</h2></div>
+          <div className="form-grid" style={{ gridTemplateColumns: '1fr', padding: 0 }}>
+            <label>Tier
+              <select value={c.retainer_tier || ''} onChange={e => onTierChange(c.id, e.target.value)}>
+                <option value="">— none —</option>
+                {retainerTiers.map(t => <option key={t} value={t}>{t}</option>)}
+              </select>
+            </label>
           </div>
-        ))}
+          {c.retainer_tier && retainerGoalTemplates[c.retainer_tier]?.length > 0 && (
+            <button className="text-btn" style={{ marginTop: 12 }} onClick={() => onApplyTemplate(c, c.retainer_tier)}>
+              <Plus /> Add {c.retainer_tier}'s standard goals
+            </button>
+          )}
+        </section>
+        <section className="panel">
+          <div className="panel-head"><h2>Add a task</h2></div>
+          <form onSubmit={submit} className="form-grid" style={{ gridTemplateColumns: '1fr 1fr', padding: 0 }}>
+            <label style={{ gridColumn: '1 / -1' }}>Title<input value={title} onChange={e => setTitle(e.target.value)} placeholder="e.g. Website Redesign" /></label>
+            <label>Category
+              <select value={category} onChange={e => setCategory(e.target.value)}>
+                <option value="goal">Goal</option><option value="deliverable">Deliverable</option>
+              </select>
+            </label>
+            <label>Priority
+              <select value={priority} onChange={e => setPriority(e.target.value)}>
+                <option value="Low">Low</option><option value="Medium">Medium</option><option value="High">High</option>
+              </select>
+            </label>
+            <label>Cadence
+              <select value={cadence} onChange={e => setCadence(e.target.value)}>
+                <option value="once">Once</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option><option value="quarterly">Quarterly</option>
+              </select>
+            </label>
+            <label>Target date<input type="date" value={targetDate} onChange={e => setTargetDate(e.target.value)} /></label>
+            <div style={{ gridColumn: '1 / -1' }}><button className="primary" type="submit"><Plus /> Add task</button></div>
+          </form>
+        </section>
+      </div>
+      <section className="panel" style={{ marginTop: 14 }}>
+        <div className="panel-head"><h2>Project board</h2></div>
+        {milestones.length ? (
+          <div className="kanban">
+            {columns.map(col => {
+              const items = milestones.filter((m: any) => bucketOf(m) === col.key)
+              return (
+                <div className="column" key={col.key} onDragOver={e => e.preventDefault()} onDrop={e => { e.preventDefault(); if (dragId) onToggleMilestone(c.id, dragId, col.key); setDragId(null) }}>
+                  <div className="col-head"><b>{col.label}</b><span>{items.length}</span></div>
+                  {items.map((m: any) => (
+                    <div className="deal-card project-card" key={m.id} draggable onDragStart={() => setDragId(m.id)} onDragEnd={() => setDragId(null)}>
+                      <div className="card-top">
+                        <b>{m.title}</b>
+                        <button className="icon-btn" style={{ padding: 4, background: 'none', border: 0 }} onClick={() => onDeleteMilestone(c.id, m.id)} title="Delete"><Trash2 /></button>
+                      </div>
+                      <div className="card-tags">
+                        <span className="chip">{m.category}</span>
+                        <span className={`priority ${(m.priority || 'Medium').toLowerCase()}`}>{m.priority || 'Medium'}</span>
+                        {m.cadence && m.cadence !== 'once' && <span className="chip">{m.cadence}</span>}
+                        {m.target_date && <span className="chip">{new Date(m.target_date).toLocaleDateString()}</span>}
+                      </div>
+                      <div className="progress-track"><div className="progress-fill" style={{ width: `${m.progress ?? 0}%` }} /></div>
+                      <div className="progress-row">
+                        <input type="number" min={0} max={100} value={m.progress ?? 0} onChange={e => onUpdateProgress(c.id, m.id, Math.max(0, Math.min(100, +e.target.value || 0)))} />
+                        <span>% complete</span>
+                      </div>
+                    </div>
+                  ))}
+                  {!items.length && <p style={{ fontSize: 11, color: 'var(--muted)', padding: '8px 2px' }}>Drop a task here</p>}
+                </div>
+              )
+            })}
+          </div>
+        ) : <Empty title="No tasks yet" text="Add one above, or apply the retainer tier's standard goals." />}
       </section>
-    </div>
+    </>
   )
 }
 

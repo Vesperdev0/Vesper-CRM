@@ -195,3 +195,9 @@ begin
 end; $$;
 drop trigger if exists on_auth_user_created on auth.users;
 create trigger on_auth_user_created after insert on auth.users for each row execute procedure public.handle_new_user();
+
+-- 2026-09-07: upgrade milestones into a full project-task board (priority, progress, in-progress status)
+alter table milestones add column if not exists priority text not null default 'Medium' check (priority in ('Low','Medium','High'));
+alter table milestones add column if not exists progress smallint not null default 0 check (progress >= 0 and progress <= 100);
+alter table milestones drop constraint if exists milestones_status_check;
+alter table milestones add constraint milestones_status_check check (status in ('pending','in_progress','done','missed'));
