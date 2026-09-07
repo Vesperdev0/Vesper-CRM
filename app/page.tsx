@@ -439,6 +439,7 @@ export default function Page() {
           <Nav active={view === 'home'} icon={<Home />} label="Today" onClick={() => setView('home')} />
           <Nav active={view === 'pipeline'} icon={<Kanban />} label="Pipeline" onClick={() => setView('pipeline')} />
           <Nav active={view === 'companies'} icon={<Users />} label="Companies" onClick={() => setView('companies')} />
+          <Nav active={view === 'projects'} icon={<LayoutGrid />} label="Projects" onClick={() => setView('projects')} />
           <Nav active={view === 'calendar'} icon={<Calendar />} label="Calendar" onClick={() => setView('calendar')} />
           <Nav active={view === 'tasks'} icon={<CheckCircle2 />} label="Tasks" onClick={() => setView('tasks')} />
         </nav>
@@ -462,6 +463,7 @@ export default function Page() {
           {view === 'home' && <HomeView companies={companies} meetings={meetings} onOpen={(c: any) => { setSelected(c); setView('detail') }} onNew={() => setShowNew(true)} onGoCalendar={() => setView('calendar')} onDeleteMeeting={deleteMeeting} />}
           {view === 'pipeline' && <Pipeline companies={filtered} onOpen={(c: any) => { setSelected(c); setView('detail') }} onUpdate={handleStageChange} onOutreachChange={updateOutreachStatus} />}
           {view === 'companies' && <Companies companies={filtered} onOpen={(c: any) => { setSelected(c); setView('detail') }} onNew={() => setShowNew(true)} onOutreachChange={updateOutreachStatus} />}
+          {view === 'projects' && <ProjectsView companies={companies} onToggleMilestone={toggleMilestone} onUpdateProgress={updateMilestoneProgress} onDeleteMilestone={deleteMilestone} onOpenCompany={(c: any) => { setSelected(c); setView('detail') }} />}
           {view === 'calendar' && <CalendarView meetings={meetings} googleConn={googleConn} onSync={syncGoogleCalendar} onDeleteMeeting={deleteMeeting} />}
           {view === 'tasks' && <Tasks tasks={tasks} companies={companies} onToggle={toggleTask} onAdd={addTask} />}
           {view === 'settings' && <SettingsView googleConn={googleConn} />}
@@ -492,6 +494,7 @@ export default function Page() {
         <Nav active={view === 'home'} icon={<Home />} label="Today" onClick={() => setView('home')} />
         <Nav active={view === 'pipeline'} icon={<Kanban />} label="Pipeline" onClick={() => setView('pipeline')} />
         <Nav active={view === 'companies'} icon={<Users />} label="Companies" onClick={() => setView('companies')} />
+        <Nav active={view === 'projects'} icon={<LayoutGrid />} label="Projects" onClick={() => setView('projects')} />
         <Nav active={view === 'calendar'} icon={<Calendar />} label="Calendar" onClick={() => setView('calendar')} />
         <Nav active={view === 'tasks'} icon={<CheckCircle2 />} label="Tasks" onClick={() => setView('tasks')} />
       </nav>
@@ -954,6 +957,87 @@ function Tasks({ tasks, companies, onToggle, onAdd }: { tasks: any[]; companies:
           </div>
         ))}
       </div>
+    </>
+  )
+}
+
+function ProjectsView({ companies, onToggleMilestone, onUpdateProgress, onDeleteMilestone, onOpenCompany }: { companies: any[]; onToggleMilestone: any; onUpdateProgress: any; onDeleteMilestone: any; onOpenCompany: any }) {
+  const [statusFilter, setStatusFilter] = useState('all')
+  const [priorityFilter, setPriorityFilter] = useState('all')
+  const [drag, setDrag] = useState<{ id: string; companyId: string } | null>(null)
+  const bucketOf = (m: any) => (m.status === 'in_progress' ? 'in_progress' : m.status === 'done' ? 'done' : 'pending')
+  const all = companies.flatMap((c: any) => (c.milestones || []).map((m: any) => ({ ...m, companyName: c.name, companyId: c.id })))
+  const filtered = all.filter((m: any) =>
+    (priorityFilter === 'all' || (m.priority || 'Medium') === priorityFilter) &&
+    (statusFilter === 'all' || bucketOf(m) === statusFilter)
+  )
+  const columns: { key: string; label: string }[] = [
+    { key: 'pending', label: 'Not started' },
+    { key: 'in_progress', label: 'In progress' },
+    { key: 'done', label: 'Done' },
+  ]
+  function openCompany(companyId: string) {
+    const full = companies.find((c: any) => c.id === companyId)
+    if (full) onOpenCompany(full)
+  }
+  return (
+    <>
+      <div className="page-title"><div><div className="eyebrow">ALL CLIENTS</div><h1>Projects.</h1><p>Every open goal and deliverable, across every company, in one place.</p></div></div>
+      <div className="filterbar">
+        <span>{filtered.length} task{filtered.length === 1 ? '' : 's'}</span>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)}>
+            <option value="all">All statuses</option>
+            <option value="pending">Not started</option>
+            <option value="in_progress">In progress</option>
+            <option value="done">Done</option>
+          </select>
+          <select value={priorityFilter} onChange={e => setPriorityFilter(e.target.value)}>
+            <option value="all">All priorities</option>
+            <option value="Low">Low</option>
+            <option value="Medium">Medium</option>
+            <option value="High">High</option>
+          </select>
+        </div>
+      </div>
+      {all.length ? (
+        <div className="kanban">
+          {columns.map(col => {
+            const items = filtered.filter((m: any) => bucketOf(m) === col.key)
+            return (
+              <div
+                className="column"
+                key={col.key}
+                onDragOver={e => e.preventDefault()}
+                onDrop={e => { e.preventDefault(); if (drag) onToggleMilestone(drag.companyId, drag.id, col.key); setDrag(null) }}
+              >
+                <div className="col-head"><b>{col.label}</b><span>{items.length}</span></div>
+                {items.map((m: any) => (
+                  <div className="deal-card project-card" key={m.id} draggable onDragStart={() => setDrag({ id: m.id, companyId: m.companyId })} onDragEnd={() => setDrag(null)}>
+                    <div className="card-top">
+                      <b>{m.title}</b>
+                      <button className="icon-btn" style={{ padding: 4, background: 'none', border: 0 }} onClick={() => onDeleteMilestone(m.companyId, m.id)} title="Delete"><Trash2 /></button>
+                    </div>
+                    <button className="text-btn" style={{ padding: '2px 0', marginBottom: 4, fontSize: 11 }} onClick={() => openCompany(m.companyId)}>{m.companyName}</button>
+                    <div className="card-tags">
+                      <span className="chip">{m.category}</span>
+                      <span className={`priority ${(m.priority || 'Medium').toLowerCase()}`}>{m.priority || 'Medium'}</span>
+                      {m.cadence && m.cadence !== 'once' && <span className="chip">{m.cadence}</span>}
+                      {m.target_date && <span className="chip">{new Date(m.target_date).toLocaleDateString()}</span>}
+                    </div>
+                    <div className="progress-track"><div className="progress-fill" style={{ width: `${m.progress ?? 0}%` }} /></div>
+                    <div className="progress-row">
+                      <input type="number" min={0} max={100} value={m.progress ?? 0} onChange={e => onUpdateProgress(m.companyId, m.id, Math.max(0, Math.min(100, +e.target.value || 0)))} />
+                      <span>% complete</span>
+                    </div>
+                  </div>
+                ))}
+                {!items.length && <p style={{ fontSize: 11, color: 'var(--muted)', padding: '8px 2px' }}>Nothing here</p>}
+              </div>
+            )
+          })}
+        </div>
+      ) : <Empty title="No projects yet" text="Add goals or deliverables from a company's Project tab." />}
     </>
   )
 }
