@@ -45,6 +45,7 @@ export default function Page() {
   const [editCompany, setEditCompany] = useState<any>(null)
   const [showActivity, setShowActivity] = useState<any>(null)
   const [showMeeting, setShowMeeting] = useState<any>(null)
+  const [deletingId, setDeletingId] = useState<string | null>(null)
   const [ai, setAi] = useState('')
   const [aiResult, setAiResult] = useState<any[]>([])
   const searchRef = useRef<HTMLInputElement>(null)
@@ -226,22 +227,27 @@ export default function Page() {
 
   async function deleteCompany(id: string) {
     if (!confirm('Delete this company? This cannot be undone.')) return
-    // Cancel the Google Calendar event for every meeting this company has, BEFORE deleting the
-    // company. Otherwise: the DB cascade-deletes the local `meetings` rows, the Google event is
-    // left dangling, and the next calendar sync re-imports it as a new, company-less meeting —
-    // the deleted data quietly comes back. Best-effort: if a delete call fails (e.g. an expired
-    // token), we still proceed with deleting the company rather than blocking on Google's API.
-    const linkedMeetings = meetings.filter(m => m.company_id === id && m.google_event_id)
-    for (const m of linkedMeetings) {
-      try {
-        await fetch(`/api/calendar/events?eventId=${encodeURIComponent(m.google_event_id)}`, { method: 'DELETE' })
-      } catch {}
+    setDeletingId(id)
+    try {
+      // Cancel the Google Calendar event for every meeting this company has, BEFORE deleting
+      // the company — in parallel, not one at a time, since each is an independent network call
+      // to Google and there's no reason to pay for them sequentially (this was the main source
+      // of "delete feels slow" when a company had more than one meeting). Otherwise: the DB
+      // cascade-deletes the local `meetings` rows, the Google event is left dangling, and the
+      // next calendar sync re-imports it as a new, company-less meeting. Best-effort: a failed
+      // Google call doesn't block deleting the company.
+      const linkedMeetings = meetings.filter(m => m.company_id === id && m.google_event_id)
+      await Promise.all(linkedMeetings.map(m =>
+        fetch(`/api/calendar/events?eventId=${encodeURIComponent(m.google_event_id)}`, { method: 'DELETE' }).catch(() => {})
+      ))
+      const { error } = await supabase.from('companies').delete().eq('id', id)
+      if (error) { alert(error.message); return }
+      setCompanies(x => x.filter(z => z.id !== id))
+      setMeetings(x => x.filter(m => m.company_id !== id))
+      setSelected(null); setView('companies')
+    } finally {
+      setDeletingId(null)
     }
-    const { error } = await supabase.from('companies').delete().eq('id', id)
-    if (error) { alert(error.message); return }
-    setCompanies(x => x.filter(z => z.id !== id))
-    setMeetings(x => x.filter(m => m.company_id !== id))
-    setSelected(null); setView('companies')
   }
 
   async function addActivity(company: any, a: { type: string; title: string; body?: string }) {
@@ -267,14 +273,24 @@ export default function Page() {
   }
 
   async function scheduleMeeting(company: any, m: { title: string; starts_at: string; ends_at: string; location?: string }) {
-    const res = await fetch('/api/calendar/events', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title: m.title, description: `VESPER meeting with ${company.name}`, location: m.location || '', starts_at: m.starts_at, ends_at: m.ends_at }),
-    })
+    // The Google Calendar round trip (creating the event + provisioning a Meet link) is the one
+    // genuinely slow step here and can't be shortened from our side — but everything that used
+    // to run strictly AFTER it in sequence didn't need to: auth.getUser() doesn't depend on the
+    // calendar call, so it runs alongside it instead of after. And logging the activity +
+    // refetching the company's full activity feed doesn't need to finish before the modal
+    // closes, since the meeting itself is already visible on the Calendar view once inserted —
+    // so that part now runs in the background instead of blocking the close.
+    const [res, authRes] = await Promise.all([
+      fetch('/api/calendar/events', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: m.title, description: `VESPER meeting with ${company.name}`, location: m.location || '', starts_at: m.starts_at, ends_at: m.ends_at }),
+      }),
+      supabase.auth.getUser(),
+    ])
     const json = await res.json().catch(() => ({}))
     if (!res.ok) { alert(json.error || 'Could not create the calendar event. Connect Google Calendar in Settings first.'); return }
-    const { data: auth } = await supabase.auth.getUser()
+    const auth = authRes.data
     const ev = json.event
     const { data: row, error } = await supabase.from('meetings').insert({
       company_id: company.id, created_by: auth.user?.id, title: m.title, starts_at: m.starts_at, ends_at: m.ends_at,
@@ -283,9 +299,9 @@ export default function Page() {
     }).select('*,companies(name)').single()
     if (error) { alert(error.message); return }
     setMeetings(x => [...x, row].sort((a, b) => a.starts_at.localeCompare(b.starts_at)))
-    await supabase.from('activities').insert({ company_id: company.id, user_id: auth.user?.id, type: 'meeting', title: m.title, occurred_at: m.starts_at })
-    await refetchCompany(company.id, selected?.id === company.id)
     setShowMeeting(null)
+    supabase.from('activities').insert({ company_id: company.id, user_id: auth.user?.id, type: 'meeting', title: m.title, occurred_at: m.starts_at })
+      .then(() => refetchCompany(company.id, selected?.id === company.id))
   }
 
   function runAI() {
@@ -357,6 +373,7 @@ export default function Page() {
               onAddActivity={(c: any) => setShowActivity(c)}
               onScheduleMeeting={(c: any) => setShowMeeting(c)}
               onSaveNotes={handleSaveNotes}
+              deleting={deletingId === selected.id}
             />
           )}
         </div>
@@ -506,7 +523,7 @@ function Companies({ companies, onOpen, onNew }: { companies: any[]; onOpen: any
   )
 }
 
-function Detail({ c, onBack, onUpdate, onEdit, onDelete, onAddActivity, onScheduleMeeting, onSaveNotes }: { c: any; onBack: any; onUpdate: any; onEdit: any; onDelete: any; onAddActivity: any; onScheduleMeeting: any; onSaveNotes: any }) {
+function Detail({ c, onBack, onUpdate, onEdit, onDelete, onAddActivity, onScheduleMeeting, onSaveNotes, deleting }: { c: any; onBack: any; onUpdate: any; onEdit: any; onDelete: any; onAddActivity: any; onScheduleMeeting: any; onSaveNotes: any; deleting?: boolean }) {
   const [tab, setTab] = useState('overview')
   const [notes, setNotes] = useState(c.remarks || '')
   useEffect(() => { setNotes(c.remarks || '') }, [c.id])
@@ -521,7 +538,7 @@ function Detail({ c, onBack, onUpdate, onEdit, onDelete, onAddActivity, onSchedu
           <button className="ghost" onClick={() => onScheduleMeeting(c)}><Calendar /> New meeting</button>
           <button className="primary" onClick={() => onAddActivity(c)}><Plus /> Activity</button>
           <button className="icon-btn" onClick={() => onEdit(c)} title="Edit"><Pencil /></button>
-          <button className="icon-btn" onClick={() => onDelete(c.id)} title="Delete"><Trash2 /></button>
+          <button className="icon-btn" onClick={() => onDelete(c.id)} disabled={deleting} title={deleting ? 'Deleting\u2026' : 'Delete'} style={deleting ? { opacity: 0.5, cursor: 'wait' } : undefined}><Trash2 /></button>
         </div>
       </div>
       <div className="detail-stage">
@@ -759,24 +776,27 @@ function NewMeetingForm({ company, onClose, onSave }: { company: any; onClose: (
   const [start, setStart] = useState('11:30')
   const [duration, setDuration] = useState(30)
   const [location, setLocation] = useState('Google Meet')
-  function submit() {
+  const [saving, setSaving] = useState(false)
+  async function submit() {
     if (!date) { alert('Pick a date'); return }
     const starts_at = new Date(`${date}T${start}:00`)
     const ends_at = new Date(starts_at.getTime() + duration * 60000)
-    onSave({ title, starts_at: starts_at.toISOString(), ends_at: ends_at.toISOString(), location })
+    setSaving(true)
+    await onSave({ title, starts_at: starts_at.toISOString(), ends_at: ends_at.toISOString(), location })
+    setSaving(false)
   }
   return (
     <div className="modal-back">
       <div className="modal" style={{ width: 'min(500px,96vw)' }}>
-        <div className="modal-head"><div><div className="eyebrow">NEW MEETING</div><h2>{company.name}</h2></div><button onClick={onClose}><X /></button></div>
+        <div className="modal-head"><div><div className="eyebrow">NEW MEETING</div><h2>{company.name}</h2></div><button onClick={onClose} disabled={saving}><X /></button></div>
         <div className="form-grid" style={{ gridTemplateColumns: '1fr 1fr' }}>
-          <label style={{ gridColumn: '1 / -1' }}>Title<input value={title} onChange={e => setTitle(e.target.value)} /></label>
-          <label>Date<input type="date" value={date} onChange={e => setDate(e.target.value)} /></label>
-          <label>Start time<input type="time" value={start} onChange={e => setStart(e.target.value)} /></label>
-          <label>Duration (min)<input type="number" value={duration} onChange={e => setDuration(+e.target.value)} /></label>
-          <label>Location<input value={location} onChange={e => setLocation(e.target.value)} /></label>
+          <label style={{ gridColumn: '1 / -1' }}>Title<input value={title} onChange={e => setTitle(e.target.value)} disabled={saving} /></label>
+          <label>Date<input type="date" value={date} onChange={e => setDate(e.target.value)} disabled={saving} /></label>
+          <label>Start time<input type="time" value={start} onChange={e => setStart(e.target.value)} disabled={saving} /></label>
+          <label>Duration (min)<input type="number" value={duration} onChange={e => setDuration(+e.target.value)} disabled={saving} /></label>
+          <label>Location<input value={location} onChange={e => setLocation(e.target.value)} disabled={saving} /></label>
         </div>
-        <div className="modal-foot"><button className="ghost" onClick={onClose}>Cancel</button><button className="primary" onClick={submit}>Schedule &amp; create Google event</button></div>
+        <div className="modal-foot"><button className="ghost" onClick={onClose} disabled={saving}>Cancel</button><button className="primary" onClick={submit} disabled={saving}>{saving ? 'Creating\u2026' : 'Schedule & create Google event'}</button></div>
       </div>
     </div>
   )
