@@ -115,6 +115,21 @@ export default function Page() {
     await loadMeetings()
   }
 
+  async function deleteMeeting(m: any) {
+    if (!confirm(`Delete "${m.title}"? This cannot be undone.`)) return
+    // Cancel the Google Calendar event first (same reasoning as deleteCompany: if we only
+    // delete the local row, the next calendar sync poll finds the still-live Google event and
+    // re-imports it as a new, unlinked meeting — the deletion doesn't stick).
+    if (m.google_event_id) {
+      try {
+        await fetch(`/api/calendar/events?eventId=${encodeURIComponent(m.google_event_id)}`, { method: 'DELETE' })
+      } catch {}
+    }
+    const { error } = await supabase.from('meetings').delete().eq('id', m.id)
+    if (error) { alert(error.message); return }
+    setMeetings(x => x.filter(mm => mm.id !== m.id))
+  }
+
   useEffect(() => {
     supabase.auth.getSession().then(async ({ data }) => {
       setUser(data.session?.user || null)
@@ -433,10 +448,10 @@ export default function Page() {
           </div>
         </header>
         <div className="content">
-          {view === 'home' && <HomeView companies={companies} meetings={meetings} onOpen={(c: any) => { setSelected(c); setView('detail') }} onNew={() => setShowNew(true)} onGoCalendar={() => setView('calendar')} />}
+          {view === 'home' && <HomeView companies={companies} meetings={meetings} onOpen={(c: any) => { setSelected(c); setView('detail') }} onNew={() => setShowNew(true)} onGoCalendar={() => setView('calendar')} onDeleteMeeting={deleteMeeting} />}
           {view === 'pipeline' && <Pipeline companies={filtered} onOpen={(c: any) => { setSelected(c); setView('detail') }} onUpdate={handleStageChange} onOutreachChange={updateOutreachStatus} />}
           {view === 'companies' && <Companies companies={filtered} onOpen={(c: any) => { setSelected(c); setView('detail') }} onNew={() => setShowNew(true)} onOutreachChange={updateOutreachStatus} />}
-          {view === 'calendar' && <CalendarView meetings={meetings} googleConn={googleConn} onSync={syncGoogleCalendar} />}
+          {view === 'calendar' && <CalendarView meetings={meetings} googleConn={googleConn} onSync={syncGoogleCalendar} onDeleteMeeting={deleteMeeting} />}
           {view === 'tasks' && <Tasks tasks={tasks} companies={companies} onToggle={toggleTask} onAdd={addTask} />}
           {view === 'settings' && <SettingsView googleConn={googleConn} />}
           {view === 'detail' && selected && (
@@ -481,7 +496,7 @@ function Nav({ active, icon, label, onClick }: { active: boolean; icon: any; lab
   return <button className={active ? 'nav active' : 'nav'} onClick={onClick}>{icon}<span>{label}</span></button>
 }
 
-function HomeView({ companies, meetings, onOpen, onNew, onGoCalendar }: { companies: any[]; meetings: any[]; onOpen: any; onNew: any; onGoCalendar: any }) {
+function HomeView({ companies, meetings, onOpen, onNew, onGoCalendar, onDeleteMeeting }: { companies: any[]; meetings: any[]; onOpen: any; onNew: any; onGoCalendar: any; onDeleteMeeting: any }) {
   const upcoming = meetings.filter(m => new Date(m.starts_at) >= new Date(Date.now() - 3600000)).sort((a, b) => a.starts_at.localeCompare(b.starts_at))
   const qualified = companies.filter(c => c.lead_status === 'Qualified Lead').length
 
@@ -507,7 +522,7 @@ function HomeView({ companies, meetings, onOpen, onNew, onGoCalendar }: { compan
       <div className="metrics">
         <Metric label="Prospects" value={companies.length} />
         <Metric label="Qualified leads" value={qualified} />
-        <Metric label="Meetings" value={meetings.length} />
+        <Metric label="Meetings" value={upcoming.length} />
         <Metric label="Pipeline value" value={money(companies.reduce((s, c) => s + (c.deal_value || 0), 0))} />
       </div>
       <div className="grid2">
@@ -517,7 +532,7 @@ function HomeView({ companies, meetings, onOpen, onNew, onGoCalendar }: { compan
             <div className="meeting" key={m.id}>
               <div className="time"><b>{new Date(m.starts_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</b><span>{new Date(m.starts_at).toLocaleDateString([], { month: 'short', day: 'numeric' })}</span></div>
               <div><b>{m.companies?.name || '—'}</b><p>{m.meeting_type || 'Meeting'}{m.google_meet_url ? ' · Google Meet' : ''}</p></div>
-              <ChevronRight />
+              <button className="icon-btn" onClick={() => onDeleteMeeting(m)} title="Delete meeting"><Trash2 /></button>
             </div>
           )) : <Empty title="No meetings yet" text="Meetings you schedule from a company page will appear here." />}
         </section>
@@ -777,7 +792,7 @@ function ProjectPanel({ c, onStageChange, onTierChange, onAddMilestone, onToggle
   )
 }
 
-function CalendarView({ meetings, googleConn, onSync }: { meetings: any[]; googleConn: any; onSync: (manual?: boolean) => void | Promise<void> }) {
+function CalendarView({ meetings, googleConn, onSync, onDeleteMeeting }: { meetings: any[]; googleConn: any; onSync: (manual?: boolean) => void | Promise<void>; onDeleteMeeting: any }) {
   const [weekStart, setWeekStart] = useState<Date>(() => startOfWeek(new Date(), { weekStartsOn: 1 }))
   const [syncing, setSyncing] = useState(false)
   const days = [0, 1, 2, 3, 4, 5, 6].map(i => addDays(weekStart, i))
@@ -828,7 +843,10 @@ function CalendarView({ meetings, googleConn, onSync }: { meetings: any[]; googl
               <div className="day" key={d.toISOString()}>
                 <b>{format(d, 'd')}</b>
                 {dayMeetings.map((m: any) => (
-                  <div className="cal-event" key={m.id}><strong>{m.companies?.name || m.title}</strong><small>{m.title}{m.google_meet_url ? ' · Meet' : ''}</small></div>
+                  <div className="cal-event" key={m.id}>
+                    <button className="cal-event-delete" onClick={() => onDeleteMeeting(m)} title="Delete meeting"><X /></button>
+                    <strong>{m.companies?.name || m.title}</strong><small>{m.title}{m.google_meet_url ? ' · Meet' : ''}</small>
+                  </div>
                 ))}
               </div>
             )
