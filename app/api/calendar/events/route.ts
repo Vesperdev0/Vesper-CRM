@@ -1,5 +1,31 @@
-import {NextRequest,NextResponse} from 'next/server'; import {getServerSupabase} from '../../../../lib/server'; import {calendarClient} from '../../../../lib/google';
-export async function POST(req:NextRequest){const sup=await getServerSupabase();const {data:{user}}=await sup.auth.getUser();if(!user)return NextResponse.json({error:'Unauthorized'},{status:401});const body=await req.json();const {data:conn}=await sup.from('calendar_connections').select('*').eq('user_id',user.id).single();if(!conn)return NextResponse.json({error:'Connect Google Calendar first'},{status:400});const {calendar}=await calendarClient(conn.access_token,conn.refresh_token);const event=await calendar.events.insert({calendarId:conn.calendar_id||'primary',conferenceDataVersion:1,requestBody:{summary:body.title,description:body.description||'',location:body.location||'',start:{dateTime:body.starts_at},end:{dateTime:body.ends_at},conferenceData:{createRequest:{requestId:crypto.randomUUID(),conferenceSolutionKey:{type:'hangoutsMeet'}}}}});return NextResponse.json({event:event.data})}
+import { NextRequest, NextResponse } from 'next/server'
+import { getServerSupabase } from '../../../../lib/server'
+import { connectedCalendar } from '../../../../lib/google'
+
+export async function POST(req: NextRequest) {
+  const sup = await getServerSupabase()
+  const { data: { user } } = await sup.auth.getUser()
+  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+
+  const body = await req.json()
+  const cc = await connectedCalendar(sup, user.id)
+  if (!cc) return NextResponse.json({ error: 'Connect Google Calendar first' }, { status: 400 })
+  const { conn, calendar } = cc
+
+  const event = await calendar.events.insert({
+    calendarId: conn.calendar_id || 'primary',
+    conferenceDataVersion: 1,
+    requestBody: {
+      summary: body.title,
+      description: body.description || '',
+      location: body.location || '',
+      start: { dateTime: body.starts_at },
+      end: { dateTime: body.ends_at },
+      conferenceData: { createRequest: { requestId: crypto.randomUUID(), conferenceSolutionKey: { type: 'hangoutsMeet' } } },
+    },
+  })
+  return NextResponse.json({ event: event.data })
+}
 
 export async function DELETE(req: NextRequest) {
   const sup = await getServerSupabase()
@@ -9,10 +35,10 @@ export async function DELETE(req: NextRequest) {
   const eventId = req.nextUrl.searchParams.get('eventId')
   if (!eventId) return NextResponse.json({ error: 'Missing eventId' }, { status: 400 })
 
-  const { data: conn } = await sup.from('calendar_connections').select('*').eq('user_id', user.id).single()
-  if (!conn) return NextResponse.json({ error: 'Connect Google Calendar first' }, { status: 400 })
+  const cc = await connectedCalendar(sup, user.id)
+  if (!cc) return NextResponse.json({ error: 'Connect Google Calendar first' }, { status: 400 })
+  const { conn, calendar } = cc
 
-  const { calendar } = await calendarClient(conn.access_token, conn.refresh_token)
   try {
     await calendar.events.delete({ calendarId: conn.calendar_id || 'primary', eventId })
   } catch (e: any) {
@@ -25,4 +51,3 @@ export async function DELETE(req: NextRequest) {
   }
   return NextResponse.json({ ok: true })
 }
-

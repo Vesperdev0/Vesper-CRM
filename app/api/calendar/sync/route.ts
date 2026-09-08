@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { getServerSupabase } from '../../../../lib/server'
-import { calendarClient } from '../../../../lib/google'
+import { connectedCalendar } from '../../../../lib/google'
 
 // Pulls events from the connected Google Calendar and mirrors them into the local `meetings`
 // table. Meetings VESPER itself created already carry their google_event_id (set at creation
@@ -8,19 +8,18 @@ import { calendarClient } from '../../../../lib/google'
 // duplicating them. Anything on the calendar that VESPER didn't create lands as a new,
 // company-less meeting row — link it to a company by hand from the Companies view.
 //
-// Known limitation: this only adds/updates events, it doesn't remove local meetings when the
-// matching Google event is deleted or cancelled (events.list doesn't return cancellations
-// unless you ask for them, and handling that safely needs more care than "functional ASAP"
-// calls for right now). Revisit if stale cancelled meetings become a real problem.
+// Deletions propagate too: showDeleted makes events.list include cancelled events, and their
+// local mirror rows are removed. Only within the listing window (past week onward, 250 events)
+// — an event cancelled while older than that window keeps its local row, which is the same
+// window in which we'd have stopped showing it anyway.
 export async function POST() {
   const sup = await getServerSupabase()
   const { data: { user } } = await sup.auth.getUser()
   if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
-  const { data: conn } = await sup.from('calendar_connections').select('*').eq('user_id', user.id).single()
-  if (!conn) return NextResponse.json({ error: 'Connect Google Calendar first' }, { status: 400 })
-
-  const { calendar } = await calendarClient(conn.access_token, conn.refresh_token)
+  const cc = await connectedCalendar(sup, user.id)
+  if (!cc) return NextResponse.json({ error: 'Connect Google Calendar first' }, { status: 400 })
+  const { conn, calendar } = cc
 
   let events: any[]
   try {
@@ -30,10 +29,17 @@ export async function POST() {
       singleEvents: true,
       orderBy: 'startTime',
       maxResults: 250,
+      showDeleted: true,
     })
     events = res.data.items || []
   } catch (e: any) {
     return NextResponse.json({ error: e?.message || 'Could not reach Google Calendar. Try reconnecting it.' }, { status: 502 })
+  }
+
+  const cancelledIds = events.filter(ev => ev.id && ev.status === 'cancelled').map(ev => ev.id as string)
+  if (cancelledIds.length) {
+    const { error } = await sup.from('meetings').delete().in('google_event_id', cancelledIds)
+    if (error) return NextResponse.json({ error: error.message }, { status: 500 })
   }
 
   const rows = events
@@ -46,7 +52,8 @@ export async function POST() {
       ends_at: ev.end?.dateTime || ev.end?.date || ev.start?.dateTime || ev.start?.date,
       location: ev.location || null,
       google_meet_url: ev.hangoutLink || null,
-      status: 'scheduled',
+      // `status` deliberately absent: new rows get the DB default ('scheduled'), and a status
+      // someone set locally (e.g. completed) survives the re-sync instead of reverting.
     }))
 
   if (rows.length) {
@@ -57,5 +64,5 @@ export async function POST() {
     if (error) return NextResponse.json({ error: error.message }, { status: 500 })
   }
 
-  return NextResponse.json({ synced: rows.length })
+  return NextResponse.json({ synced: rows.length, removed: cancelledIds.length })
 }

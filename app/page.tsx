@@ -50,11 +50,37 @@ function money(n: number | null) {
   return n == null ? '—' : new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 }).format(n)
 }
 function initials(n: string) {
-  return n.split(' ').map(x => x[0]).slice(0, 2).join('').toUpperCase()
+  // Split on runs of whitespace and drop empties — "  Acme" or "Acme  Co" used to produce an
+  // undefined x[0] and crash on .toUpperCase().
+  return n.trim().split(/\s+/).filter(Boolean).map(x => x[0]).slice(0, 2).join('').toUpperCase() || '?'
 }
 function fmtDate(d: string | null | undefined) {
   if (!d) return '—'
   return new Date(d).toLocaleDateString('en-IN', { month: 'short', day: 'numeric' })
+}
+// The "ask VESPER" matcher — plain keyword rules, no external AI service. Pure function so the
+// result can be derived fresh whenever companies change (the old version ran once via a stale
+// setTimeout closure and answered the PREVIOUS question). Rules narrow cumulatively.
+function runAIQuery(query: string, companies: any[]) {
+  const s = query.toLowerCase()
+  let r = companies
+  if (s.includes('state') || s.includes('city') || s.includes('in ')) {
+    const words = s.split(/\s+/)
+    const candidate = words[words.length - 1].replace(/[?.]/g, '')
+    r = r.filter(c => (c.address || '').toLowerCase().includes(candidate))
+  }
+  if (s.includes('qualified')) r = r.filter(c => c.lead_status === 'Qualified Lead')
+  if (s.includes('website') && s.includes('no')) r = r.filter(c => c.site_condition === 'No Site')
+  if (s.includes('meeting')) r = r.filter(c => c.activities?.some((a: any) => a.type === 'meeting'))
+  return r
+}
+// A milestone counts as overdue when it isn't done and its target date has passed (or the DB
+// says 'missed' — a status the schema always had but the boards used to silently bucket into
+// "Not started" with no visual difference).
+function isOverdue(m: any) {
+  if (m.status === 'done') return false
+  if (m.status === 'missed') return true
+  return !!m.target_date && new Date(m.target_date).getTime() < Date.now()
 }
 
 export default function Page() {
@@ -73,8 +99,7 @@ export default function Page() {
   const [showActivity, setShowActivity] = useState<any>(null)
   const [showMeeting, setShowMeeting] = useState<any>(null)
   const [deletingId, setDeletingId] = useState<string | null>(null)
-  const [ai, setAi] = useState('')
-  const [aiResult, setAiResult] = useState<any[]>([])
+  const [aiQuery, setAiQuery] = useState<string | null>(null)
   const searchRef = useRef<HTMLInputElement>(null)
 
   async function loadMeetings() {
@@ -181,6 +206,10 @@ export default function Page() {
     })
   }, [companies, q])
 
+  // Non-null while an "ask VESPER" query is active; recomputed from live data so the filtered
+  // list stays correct after edits instead of showing a snapshot.
+  const aiMatches = useMemo(() => (aiQuery == null ? null : runAIQuery(aiQuery, companies)), [aiQuery, companies])
+
   async function login(e: React.FormEvent) {
     e.preventDefault()
     const f = new FormData(e.currentTarget as HTMLFormElement)
@@ -192,14 +221,14 @@ export default function Page() {
   }
   async function logout() {
     await supabase.auth.signOut()
-    setUser(null); setCompanies([]); setTasks([]); setMeetings([]); setSelected(null); setView('home')
+    setUser(null); setCompanies([]); setTasks([]); setMeetings([]); setSelected(null); setAiQuery(null); setView('home')
   }
 
   async function addCompany(c: any) {
     const { data: auth } = await supabase.auth.getUser()
     const { data: row, error } = await supabase.from('companies').insert({
       name: c.name, lead_status: c.lead_status, lead_score: c.lead_score, website: c.website,
-      site_condition: c.site_condition, gbp: c.gbp, deal_value: c.deal_value, deal_value_type: c.deal_value_type,
+      site_condition: c.site_condition, gbp: c.gbp, deal_value: c.deal_value,
       client_type: c.client_type, company_email: c.company_email, company_phone: c.company_phone,
       instagram: c.instagram, linkedin: c.linkedin, address: c.address, remarks: c.remarks, owner_id: auth.user?.id,
     }).select().single()
@@ -304,7 +333,7 @@ export default function Page() {
   async function saveEditedCompany(id: string, c: any) {
     const { error } = await supabase.from('companies').update({
       name: c.name, lead_status: c.lead_status, lead_score: c.lead_score, website: c.website,
-      site_condition: c.site_condition, gbp: c.gbp, deal_value: c.deal_value, deal_value_type: c.deal_value_type,
+      site_condition: c.site_condition, gbp: c.gbp, deal_value: c.deal_value,
       client_type: c.client_type, company_email: c.company_email, company_phone: c.company_phone,
       instagram: c.instagram, linkedin: c.linkedin, address: c.address, remarks: c.remarks,
     }).eq('id', id)
@@ -372,6 +401,11 @@ export default function Page() {
     if (error) { alert(error.message); return }
     setTasks(x => x.map(t => (t.id === id ? { ...t, completed } : t)))
   }
+  async function deleteTask(id: string) {
+    const { error } = await supabase.from('tasks').delete().eq('id', id)
+    if (error) { alert(error.message); return }
+    setTasks(x => x.filter(t => t.id !== id))
+  }
 
   async function scheduleMeeting(company: any, m: { title: string; starts_at: string; ends_at: string; location?: string }) {
     // The Google Calendar round trip (creating the event + provisioning a Meet link) is the one
@@ -403,15 +437,6 @@ export default function Page() {
     setShowMeeting(null)
     supabase.from('activities').insert({ company_id: company.id, user_id: auth.user?.id, type: 'meeting', title: m.title, occurred_at: m.starts_at })
       .then(() => refetchCompany(company.id, selected?.id === company.id))
-  }
-
-  function runAI() {
-    const s = ai.toLowerCase(); let r = companies
-    if (s.includes('state') || s.includes('city') || s.includes('in ')) { const words = s.split(/\s+/); const candidate = words[words.length - 1].replace(/[?.]/g, ''); r = companies.filter(c => (c.address || '').toLowerCase().includes(candidate)) }
-    if (s.includes('qualified')) r = companies.filter(c => c.lead_status === 'Qualified Lead')
-    if (s.includes('website') && s.includes('no')) r = companies.filter(c => c.site_condition === 'No Site')
-    if (s.includes('meeting')) r = companies.filter(c => c.activities?.some((a: any) => a.type === 'meeting'))
-    setAiResult(r)
   }
 
   if (loading) return <div className="splash">VESPER</div>
@@ -462,10 +487,10 @@ export default function Page() {
         <div className="content">
           {view === 'home' && <HomeView companies={companies} meetings={meetings} onOpen={(c: any) => { setSelected(c); setView('detail') }} onNew={() => setShowNew(true)} onGoCalendar={() => setView('calendar')} onDeleteMeeting={deleteMeeting} />}
           {view === 'pipeline' && <Pipeline companies={filtered} onOpen={(c: any) => { setSelected(c); setView('detail') }} onUpdate={handleStageChange} onOutreachChange={updateOutreachStatus} />}
-          {view === 'companies' && <Companies companies={filtered} onOpen={(c: any) => { setSelected(c); setView('detail') }} onNew={() => setShowNew(true)} onOutreachChange={updateOutreachStatus} />}
+          {view === 'companies' && <Companies companies={aiMatches ?? filtered} onOpen={(c: any) => { setSelected(c); setView('detail') }} onNew={() => setShowNew(true)} onOutreachChange={updateOutreachStatus} />}
           {view === 'projects' && <ProjectsView companies={companies} onToggleMilestone={toggleMilestone} onUpdateProgress={updateMilestoneProgress} onDeleteMilestone={deleteMilestone} onOpenCompany={(c: any) => { setSelected(c); setView('detail') }} />}
           {view === 'calendar' && <CalendarView meetings={meetings} googleConn={googleConn} onSync={syncGoogleCalendar} onDeleteMeeting={deleteMeeting} />}
-          {view === 'tasks' && <Tasks tasks={tasks} companies={companies} onToggle={toggleTask} onAdd={addTask} />}
+          {view === 'tasks' && <Tasks tasks={tasks} companies={companies} onToggle={toggleTask} onAdd={addTask} onDelete={deleteTask} />}
           {view === 'settings' && <SettingsView googleConn={googleConn} />}
           {view === 'detail' && selected && (
             <Detail
@@ -498,12 +523,12 @@ export default function Page() {
         <Nav active={view === 'calendar'} icon={<Calendar />} label="Calendar" onClick={() => setView('calendar')} />
         <Nav active={view === 'tasks'} icon={<CheckCircle2 />} label="Tasks" onClick={() => setView('tasks')} />
       </nav>
-      <button className="ai-fab" onClick={() => { const v = prompt('Ask VESPER anything about your CRM'); if (v) { setAi(v); setTimeout(runAI, 0); setView('companies') } }}><Command /></button>
+      <button className="ai-fab" onClick={() => { const v = prompt('Ask VESPER anything about your CRM'); if (v) { setAiQuery(v); setView('companies') } }}><Command /></button>
       {showNew && <CompanyForm onClose={() => setShowNew(false)} onSave={addCompany} />}
       {editCompany && <CompanyForm initial={editCompany} onClose={() => setEditCompany(null)} onSave={(f: any) => saveEditedCompany(editCompany.id, f)} />}
       {showActivity && <AddActivity company={showActivity} onClose={() => setShowActivity(null)} onSave={(a: any) => addActivity(showActivity, a)} />}
       {showMeeting && <NewMeetingForm company={showMeeting} onClose={() => setShowMeeting(null)} onSave={(m: any) => scheduleMeeting(showMeeting, m)} />}
-      {aiResult.length > 0 && <div className="toast"><b>VESPER found {aiResult.length}</b><button onClick={() => setAiResult([])}><X /></button></div>}
+      {aiMatches != null && <div className="toast"><b>VESPER found {aiMatches.length}</b><button onClick={() => setAiQuery(null)}><X /></button></div>}
     </div>
   )
 }
@@ -835,6 +860,7 @@ function ProjectPanel({ c, onStageChange, onTierChange, onAddMilestone, onToggle
                         <span className={`priority ${(m.priority || 'Medium').toLowerCase()}`}>{m.priority || 'Medium'}</span>
                         {m.cadence && m.cadence !== 'once' && <span className="chip">{m.cadence}</span>}
                         {m.target_date && <span className="chip">{new Date(m.target_date).toLocaleDateString()}</span>}
+                        {isOverdue(m) && <span className="chip overdue">{m.status === 'missed' ? 'Missed' : 'Overdue'}</span>}
                       </div>
                       <div className="progress-track"><div className="progress-fill" style={{ width: `${m.progress ?? 0}%` }} /></div>
                       <div className="progress-row">
@@ -919,7 +945,7 @@ function CalendarView({ meetings, googleConn, onSync, onDeleteMeeting }: { meeti
   )
 }
 
-function Tasks({ tasks, companies, onToggle, onAdd }: { tasks: any[]; companies: any[]; onToggle: any; onAdd: any }) {
+function Tasks({ tasks, companies, onToggle, onAdd, onDelete }: { tasks: any[]; companies: any[]; onToggle: any; onAdd: any; onDelete: any }) {
   const [title, setTitle] = useState('')
   const [due, setDue] = useState('')
   const [companyId, setCompanyId] = useState('')
@@ -948,12 +974,14 @@ function Tasks({ tasks, companies, onToggle, onAdd }: { tasks: any[]; companies:
           <div className="task" key={t.id}>
             <button className="check" onClick={() => onToggle(t.id, true)}><span /></button>
             <div><b>{t.title}</b><p>{t.due_at ? fmtDate(t.due_at) : 'No due date'}{t.companies?.name ? ' · ' + t.companies.name : ''}</p></div>
+            <button className="icon-btn" style={{ padding: 4, background: 'none', border: 0 }} onClick={() => onDelete(t.id)} title="Delete task"><Trash2 /></button>
           </div>
         ))}
         {done.map((t: any) => (
           <div className="task" key={t.id} style={{ opacity: 0.5 }}>
             <button className="check" onClick={() => onToggle(t.id, false)}><CheckCircle2 /></button>
             <div><b style={{ textDecoration: 'line-through' }}>{t.title}</b><p>{t.companies?.name || ''}</p></div>
+            <button className="icon-btn" style={{ padding: 4, background: 'none', border: 0 }} onClick={() => onDelete(t.id)} title="Delete task"><Trash2 /></button>
           </div>
         ))}
       </div>
@@ -1024,6 +1052,7 @@ function ProjectsView({ companies, onToggleMilestone, onUpdateProgress, onDelete
                       <span className={`priority ${(m.priority || 'Medium').toLowerCase()}`}>{m.priority || 'Medium'}</span>
                       {m.cadence && m.cadence !== 'once' && <span className="chip">{m.cadence}</span>}
                       {m.target_date && <span className="chip">{new Date(m.target_date).toLocaleDateString()}</span>}
+                      {isOverdue(m) && <span className="chip overdue">{m.status === 'missed' ? 'Missed' : 'Overdue'}</span>}
                     </div>
                     <div className="progress-track"><div className="progress-fill" style={{ width: `${m.progress ?? 0}%` }} /></div>
                     <div className="progress-row">
@@ -1064,13 +1093,13 @@ function CompanyForm({ initial, onClose, onSave }: { initial?: any; onClose: () 
   const [f, setF] = useState<any>(initial ? {
     name: initial.name || '', lead_status: initial.lead_status || 'Prospect', lead_score: initial.lead_score ?? 50,
     website: initial.website || '', site_condition: initial.site_condition || 'Outdated', gbp: !!initial.gbp,
-    deal_value: initial.deal_value ?? null, deal_value_type: initial.deal_value_type || 'none',
+    deal_value: initial.deal_value ?? null,
     client_type: initial.client_type || 'not active', company_email: initial.company_email || '',
     company_phone: initial.company_phone || '', instagram: initial.instagram || '', linkedin: initial.linkedin || '',
     address: initial.address || '', remarks: initial.remarks || '',
     contact: { id: initial.contact?.id, name: initial.contact?.name || '', title: initial.contact?.title || 'Founder', email: initial.contact?.email || '', phone: initial.contact?.phone || '', instagram: initial.contact?.instagram || '', linkedin: initial.contact?.linkedin || '' },
   } : {
-    name: '', lead_status: 'Prospect', lead_score: 50, site_condition: 'Outdated', gbp: false, deal_value_type: 'none',
+    name: '', lead_status: 'Prospect', lead_score: 50, site_condition: 'Outdated', gbp: false,
     client_type: 'not active', contact: { name: '', title: 'Founder', email: '', phone: '', instagram: '', linkedin: '' },
   })
   const upd = (k: string, v: any) => setF((x: any) => ({ ...x, [k]: v }))

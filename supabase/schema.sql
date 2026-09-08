@@ -197,6 +197,13 @@ drop trigger if exists on_auth_user_created on auth.users;
 create trigger on_auth_user_created after insert on auth.users for each row execute procedure public.handle_new_user();
 
 -- 2026-09-07: upgrade milestones into a full project-task board (priority, progress, in-progress status)
+-- 2026-09-08: currently unused / reserved — nothing in the UI reads or writes these yet:
+--   companies.deal_value_min / deal_value_max / deal_value_type  (deal value ranges)
+--   opportunities  (multi-deal-per-company model)
+--   audit_log      (change history)
+--   meetings.meeting_type is written by default only; meetings.status is settable but has no UI
+-- Kept so no data is dropped; wire them up or drop them deliberately later.
+
 alter table milestones add column if not exists priority text not null default 'Medium' check (priority in ('Low','Medium','High'));
 alter table milestones add column if not exists progress smallint not null default 0 check (progress >= 0 and progress <= 100);
 alter table milestones drop constraint if exists milestones_status_check;
