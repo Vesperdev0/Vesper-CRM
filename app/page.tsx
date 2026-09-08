@@ -296,10 +296,15 @@ export default function Page() {
     if (error) { alert(error.message); return }
     patchMilestonesLocally(company.id, ms => [...ms, data])
   }
-  async function updateMilestoneProgress(companyId: string, milestoneId: string, progress: number) {
-    patchMilestonesLocally(companyId, ms => ms.map(m => (m.id === milestoneId ? { ...m, progress } : m)))
-    const { error } = await supabase.from('milestones').update({ progress }).eq('id', milestoneId)
+  // Optimistic single-field (or multi-field) milestone edit — the table view edits everything
+  // (title, status, priority, dates, cadence, category) through this one path.
+  async function updateMilestoneFields(companyId: string, milestoneId: string, patch: any) {
+    patchMilestonesLocally(companyId, ms => ms.map(m => (m.id === milestoneId ? { ...m, ...patch } : m)))
+    const { error } = await supabase.from('milestones').update(patch).eq('id', milestoneId)
     if (error) alert(error.message)
+  }
+  async function updateMilestoneProgress(companyId: string, milestoneId: string, progress: number) {
+    await updateMilestoneFields(companyId, milestoneId, { progress })
   }
   async function deleteMilestone(companyId: string, milestoneId: string) {
     const { error } = await supabase.from('milestones').delete().eq('id', milestoneId)
@@ -462,7 +467,7 @@ export default function Page() {
         <div className="side-brand" onClick={() => setView('home')} style={{ cursor: 'pointer' }}><div className="mini-logo">V</div><b>VESPER</b></div>
         <nav>
           <Nav active={view === 'home'} icon={<Home />} label="Today" onClick={() => setView('home')} />
-          <Nav active={view === 'pipeline'} icon={<Kanban />} label="Pipeline" onClick={() => setView('pipeline')} />
+          <Nav active={view === 'pipeline'} icon={<Kanban />} label="Sales" onClick={() => setView('pipeline')} />
           <Nav active={view === 'companies'} icon={<Users />} label="Companies" onClick={() => setView('companies')} />
           <Nav active={view === 'projects'} icon={<LayoutGrid />} label="Projects" onClick={() => setView('projects')} />
           <Nav active={view === 'calendar'} icon={<Calendar />} label="Calendar" onClick={() => setView('calendar')} />
@@ -488,7 +493,7 @@ export default function Page() {
           {view === 'home' && <HomeView companies={companies} meetings={meetings} onOpen={(c: any) => { setSelected(c); setView('detail') }} onNew={() => setShowNew(true)} onGoCalendar={() => setView('calendar')} onDeleteMeeting={deleteMeeting} />}
           {view === 'pipeline' && <Pipeline companies={filtered} onOpen={(c: any) => { setSelected(c); setView('detail') }} onUpdate={handleStageChange} onOutreachChange={updateOutreachStatus} />}
           {view === 'companies' && <Companies companies={aiMatches ?? filtered} onOpen={(c: any) => { setSelected(c); setView('detail') }} onNew={() => setShowNew(true)} onOutreachChange={updateOutreachStatus} />}
-          {view === 'projects' && <ProjectsView companies={companies} onToggleMilestone={toggleMilestone} onUpdateProgress={updateMilestoneProgress} onDeleteMilestone={deleteMilestone} onOpenCompany={(c: any) => { setSelected(c); setView('detail') }} />}
+          {view === 'projects' && <ProjectsView companies={companies} onToggleMilestone={toggleMilestone} onUpdateProgress={updateMilestoneProgress} onUpdateFields={updateMilestoneFields} onDeleteMilestone={deleteMilestone} onOpenCompany={(c: any) => { setSelected(c); setView('detail') }} />}
           {view === 'calendar' && <CalendarView meetings={meetings} googleConn={googleConn} onSync={syncGoogleCalendar} onDeleteMeeting={deleteMeeting} />}
           {view === 'tasks' && <Tasks tasks={tasks} companies={companies} onToggle={toggleTask} onAdd={addTask} onDelete={deleteTask} />}
           {view === 'settings' && <SettingsView googleConn={googleConn} />}
@@ -517,7 +522,7 @@ export default function Page() {
       </main>
       <nav className="bottom-nav">
         <Nav active={view === 'home'} icon={<Home />} label="Today" onClick={() => setView('home')} />
-        <Nav active={view === 'pipeline'} icon={<Kanban />} label="Pipeline" onClick={() => setView('pipeline')} />
+        <Nav active={view === 'pipeline'} icon={<Kanban />} label="Sales" onClick={() => setView('pipeline')} />
         <Nav active={view === 'companies'} icon={<Users />} label="Companies" onClick={() => setView('companies')} />
         <Nav active={view === 'projects'} icon={<LayoutGrid />} label="Projects" onClick={() => setView('projects')} />
         <Nav active={view === 'calendar'} icon={<Calendar />} label="Calendar" onClick={() => setView('calendar')} />
@@ -617,7 +622,7 @@ function Pipeline({ companies, onOpen, onUpdate, onOutreachChange }: { companies
   const [dragId, setDragId] = useState<string | null>(null)
   return (
     <>
-      <div className="page-title"><div><div className="eyebrow">PIPELINE</div><h1>Opportunity flow.</h1><p>Business progress stays here. Outreach actions live in the timeline.</p></div></div>
+      <div className="page-title"><div><div className="eyebrow">SALES</div><h1>Opportunity flow.</h1><p>Business progress stays here. Outreach actions live in the timeline.</p></div></div>
       <div className="kanban">
         {stages.map(stage => (
           <div className="column" key={stage} onDragOver={e => e.preventDefault()} onDrop={e => { e.preventDefault(); if (dragId) onUpdate(dragId, { lead_status: stage }); setDragId(null) }}>
@@ -989,15 +994,19 @@ function Tasks({ tasks, companies, onToggle, onAdd, onDelete }: { tasks: any[]; 
   )
 }
 
-function ProjectsView({ companies, onToggleMilestone, onUpdateProgress, onDeleteMilestone, onOpenCompany }: { companies: any[]; onToggleMilestone: any; onUpdateProgress: any; onDeleteMilestone: any; onOpenCompany: any }) {
+function ProjectsView({ companies, onToggleMilestone, onUpdateProgress, onUpdateFields, onDeleteMilestone, onOpenCompany }: { companies: any[]; onToggleMilestone: any; onUpdateProgress: any; onUpdateFields: any; onDeleteMilestone: any; onOpenCompany: any }) {
+  const [mode, setMode] = useState<'board' | 'table'>('board')
   const [statusFilter, setStatusFilter] = useState('all')
   const [priorityFilter, setPriorityFilter] = useState('all')
+  const [companyFilter, setCompanyFilter] = useState('all')
   const [drag, setDrag] = useState<{ id: string; companyId: string } | null>(null)
   const bucketOf = (m: any) => (m.status === 'in_progress' ? 'in_progress' : m.status === 'done' ? 'done' : 'pending')
   const all = companies.flatMap((c: any) => (c.milestones || []).map((m: any) => ({ ...m, companyName: c.name, companyId: c.id })))
+  const withTasks = companies.filter((c: any) => (c.milestones || []).length)
   const filtered = all.filter((m: any) =>
     (priorityFilter === 'all' || (m.priority || 'Medium') === priorityFilter) &&
-    (statusFilter === 'all' || bucketOf(m) === statusFilter)
+    (statusFilter === 'all' || bucketOf(m) === statusFilter) &&
+    (companyFilter === 'all' || m.companyId === companyFilter)
   )
   const columns: { key: string; label: string }[] = [
     { key: 'pending', label: 'Not started' },
@@ -1012,8 +1021,18 @@ function ProjectsView({ companies, onToggleMilestone, onUpdateProgress, onDelete
     <>
       <div className="page-title"><div><div className="eyebrow">ALL CLIENTS</div><h1>Projects.</h1><p>Every open goal and deliverable, across every company, in one place.</p></div></div>
       <div className="filterbar">
-        <span>{filtered.length} task{filtered.length === 1 ? '' : 's'}</span>
+        <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+          <div className="view-toggle">
+            <button className={mode === 'board' ? 'active' : ''} onClick={() => setMode('board')}>Board</button>
+            <button className={mode === 'table' ? 'active' : ''} onClick={() => setMode('table')}>Table</button>
+          </div>
+          <span>{filtered.length} task{filtered.length === 1 ? '' : 's'}</span>
+        </div>
         <div style={{ display: 'flex', gap: 8 }}>
+          <select value={companyFilter} onChange={e => setCompanyFilter(e.target.value)}>
+            <option value="all">All companies</option>
+            {withTasks.map((c: any) => <option key={c.id} value={c.id}>{c.name}</option>)}
+          </select>
           <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)}>
             <option value="all">All statuses</option>
             <option value="pending">Not started</option>
@@ -1028,7 +1047,9 @@ function ProjectsView({ companies, onToggleMilestone, onUpdateProgress, onDelete
           </select>
         </div>
       </div>
-      {all.length ? (
+      {!all.length ? (
+        <Empty title="No projects yet" text="Add goals or deliverables from a company's Project tab." />
+      ) : mode === 'board' ? (
         <div className="kanban">
           {columns.map(col => {
             const items = filtered.filter((m: any) => bucketOf(m) === col.key)
@@ -1066,7 +1087,72 @@ function ProjectsView({ companies, onToggleMilestone, onUpdateProgress, onDelete
             )
           })}
         </div>
-      ) : <Empty title="No projects yet" text="Add goals or deliverables from a company's Project tab." />}
+      ) : (
+        <section className="panel" style={{ padding: 0 }}>
+          <div className="table-wrap">
+            <table className="ptable">
+              <thead>
+                <tr><th>Task</th><th>Company</th><th>Status</th><th>Priority</th><th>Progress</th><th>Target date</th><th>Cadence</th><th>Category</th><th aria-label="Actions" /></tr>
+              </thead>
+              <tbody>
+                {filtered.map((m: any) => (
+                  <tr key={m.id}>
+                    <td className="title-cell">
+                      {/* Uncontrolled on purpose: commits on blur/Enter so we don't fire a DB write
+                          per keystroke; keyed on title so an edit from elsewhere refreshes it. */}
+                      <input
+                        className="title-input"
+                        key={m.id + (m.title || '')}
+                        defaultValue={m.title}
+                        onBlur={e => { const v = e.target.value.trim(); if (v && v !== m.title) onUpdateFields(m.companyId, m.id, { title: v }) }}
+                        onKeyDown={e => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
+                      />
+                    </td>
+                    <td><button className="text-btn" onClick={() => openCompany(m.companyId)}>{m.companyName}</button></td>
+                    <td>
+                      <select value={m.status || 'pending'} onChange={e => onUpdateFields(m.companyId, m.id, { status: e.target.value })}>
+                        <option value="pending">Not started</option>
+                        <option value="in_progress">In progress</option>
+                        <option value="done">Done</option>
+                        <option value="missed">Missed</option>
+                      </select>
+                    </td>
+                    <td>
+                      <select value={m.priority || 'Medium'} onChange={e => onUpdateFields(m.companyId, m.id, { priority: e.target.value })}>
+                        <option value="Low">Low</option><option value="Medium">Medium</option><option value="High">High</option>
+                      </select>
+                    </td>
+                    <td>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <input type="number" min={0} max={100} value={m.progress ?? 0} onChange={e => onUpdateProgress(m.companyId, m.id, Math.max(0, Math.min(100, +e.target.value || 0)))} />
+                        <div className="progress-track" style={{ width: 64 }}><div className="progress-fill" style={{ width: `${m.progress ?? 0}%` }} /></div>
+                      </div>
+                    </td>
+                    <td>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <input type="date" value={m.target_date ? new Date(m.target_date).toISOString().slice(0, 10) : ''} onChange={e => onUpdateFields(m.companyId, m.id, { target_date: e.target.value ? new Date(e.target.value).toISOString() : null })} />
+                        {isOverdue(m) && <span className="chip overdue">{m.status === 'missed' ? 'Missed' : 'Overdue'}</span>}
+                      </div>
+                    </td>
+                    <td>
+                      <select value={m.cadence || 'once'} onChange={e => onUpdateFields(m.companyId, m.id, { cadence: e.target.value })}>
+                        <option value="once">Once</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option><option value="quarterly">Quarterly</option>
+                      </select>
+                    </td>
+                    <td>
+                      <select value={m.category || 'goal'} onChange={e => onUpdateFields(m.companyId, m.id, { category: e.target.value })}>
+                        <option value="goal">Goal</option><option value="deliverable">Deliverable</option>
+                      </select>
+                    </td>
+                    <td><button className="icon-btn" style={{ padding: 4, background: 'none', border: 0 }} onClick={() => onDeleteMilestone(m.companyId, m.id)} title="Delete"><Trash2 /></button></td>
+                  </tr>
+                ))}
+                {!filtered.length && <tr><td colSpan={9}><Empty title="No matching tasks" text="Adjust the filters above." /></td></tr>}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
     </>
   )
 }
