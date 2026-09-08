@@ -227,6 +227,7 @@ insert into pipeline_stages (name, kind, position) values
  ('Agreement Signed','open',7),('Initial Payment Received','open',8),
  ('Closed & Onboarding','won',9),('Future Opportunity','future',10),('Lost Opportunity','lost',11)
 on conflict (name) do nothing;
+alter table companies drop constraint if exists companies_project_stage_check;
 update companies set project_stage = case project_stage
  when 'Active Project' then 'Build in Progress'
  when 'Waiting on Client' then 'Build in Progress'
@@ -234,7 +235,6 @@ update companies set project_stage = case project_stage
  when 'Won Opportunity / Active Retainer' then 'Retainer Active / Project Closed'
  else project_stage end
 where project_stage is not null;
-alter table companies drop constraint if exists companies_project_stage_check;
 alter table companies add constraint companies_project_stage_check check (project_stage in (
  'Onboarding','Round 1: Sitemap & Wireframe','Round 2: Structural Anchors',
  'Round 2.5: Portfolio + Quiz (Premium only)','Build in Progress','Round 3: Full Site Review',
