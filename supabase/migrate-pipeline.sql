@@ -32,9 +32,9 @@ update companies set project_stage = case project_stage
  else project_stage end
 where project_stage is not null;
 alter table companies add constraint companies_project_stage_check check (project_stage in (
- 'Onboarding','Round 1: Sitemap & Wireframe','Round 2: Structural Anchors',
- 'Round 2.5: Portfolio + Quiz (Premium only)','Build in Progress','Round 3: Full Site Review',
- 'Round 4: Live Revision Walkthrough','Final QA','Launch Prep','Live / Handover',
+ 'Onboarding','Sitemap & Wireframe','Structural Anchors',
+ 'Portfolio + Quiz (Premium only)','Build in Progress','Full Site Review',
+ 'Live Revision Walkthrough','Final QA','Launch Prep','Live / Handover',
  'Retainer Active / Project Closed'));
 
 -- 3) Companies already closed-won enter delivery, which removes them from the Sales board.

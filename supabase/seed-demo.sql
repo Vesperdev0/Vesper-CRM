@@ -16,7 +16,7 @@ alter table companies add column if not exists outreach_status text
   check (outreach_status in ('Not Contacted','DM Reply','DM No Reply','Call Successful','Call Failed'))
   default 'Not Contacted';
 alter table companies add column if not exists project_stage text
-  check (project_stage in ('Onboarding','Round 1: Sitemap & Wireframe','Round 2: Structural Anchors','Round 2.5: Portfolio + Quiz (Premium only)','Build in Progress','Round 3: Full Site Review','Round 4: Live Revision Walkthrough','Final QA','Launch Prep','Live / Handover','Retainer Active / Project Closed'));
+  check (project_stage in ('Onboarding','Sitemap & Wireframe','Structural Anchors','Portfolio + Quiz (Premium only)','Build in Progress','Full Site Review','Live Revision Walkthrough','Final QA','Launch Prep','Live / Handover','Retainer Active / Project Closed'));
 alter table companies add column if not exists retainer_tier text
   check (retainer_tier in ('maintenance','growth','full-service'));
 alter table milestones add column if not exists priority text not null default 'Medium' check (priority in ('Low','Medium','High'));

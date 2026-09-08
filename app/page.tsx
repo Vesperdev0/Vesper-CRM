@@ -36,12 +36,12 @@ const activityTypes = [
 // Projects board instead of the Sales board. Order here is the order of the board columns.
 const projectStages = [
   'Onboarding',
-  'Round 1: Sitemap & Wireframe',
-  'Round 2: Structural Anchors',
-  'Round 2.5: Portfolio + Quiz (Premium only)',
+  'Sitemap & Wireframe',
+  'Structural Anchors',
+  'Portfolio + Quiz (Premium only)',
   'Build in Progress',
-  'Round 3: Full Site Review',
-  'Round 4: Live Revision Walkthrough',
+  'Full Site Review',
+  'Live Revision Walkthrough',
   'Final QA',
   'Launch Prep',
   'Live / Handover',
