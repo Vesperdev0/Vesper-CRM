@@ -33,7 +33,7 @@ const activityTypes = [
 
 // The real Vesper delivery pipeline, as given by Atomeo (2026-09-08). A company enters at
 // 'Onboarding' automatically when Sales marks it closed-won, and from then on lives on the
-// Projects board instead of the Sales board. Numbers shown in the UI come from position here.
+// Projects board instead of the Sales board. Order here is the order of the board columns.
 const projectStages = [
   'Onboarding',
   'Round 1: Sitemap & Wireframe',
@@ -47,7 +47,6 @@ const projectStages = [
   'Live / Handover',
   'Retainer Active / Project Closed',
 ]
-const projectStageLabel = (s: string) => `${String(projectStages.indexOf(s) + 1).padStart(2, '0')} — ${s}`
 const retainerTiers = ['maintenance', 'growth', 'full-service']
 // Standard recurring goals per tier, taken directly from the Retainer SOP's tier tables —
 // Maintenance has no SOP-mandated recurring deliverable beyond the update allowance itself.
@@ -897,7 +896,7 @@ function ProjectPanel({ c, onStageChange, onTierChange, onAddMilestone, onToggle
             <label>Stage (post-close)
               <select value={c.project_stage || ''} onChange={e => onStageChange(c.id, e.target.value)}>
                 <option value="">— not started —</option>
-                {projectStages.map(s => <option key={s} value={s}>{projectStageLabel(s)}</option>)}
+                {projectStages.map(s => <option key={s} value={s}>{s}</option>)}
               </select>
             </label>
           </div>
@@ -1148,11 +1147,11 @@ function ProjectsView({ companies, onToggleMilestone, onUpdateProgress, onUpdate
       {mode === 'clients' ? (
         clients.length ? (
           <div className="kanban">
-            {projectStages.map((stage, i) => {
+            {projectStages.map((stage) => {
               const items = clients.filter((c: any) => c.project_stage === stage)
               return (
                 <div className="column" key={stage} onDragOver={e => e.preventDefault()} onDrop={e => { e.preventDefault(); if (dragC) onProjectStageChange(dragC, stage); setDragC(null) }}>
-                  <div className="col-head"><b>{String(i + 1).padStart(2, '0')} — {stage}</b><span>{items.length}</span></div>
+                  <div className="col-head"><b>{stage}</b><span>{items.length}</span></div>
                   {items.map((c: any) => {
                     const ms = c.milestones || []
                     const done = ms.filter((m: any) => m.status === 'done').length
