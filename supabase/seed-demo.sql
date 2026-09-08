@@ -9,6 +9,21 @@
 -- post-close project stages + retainer tiers, milestones in every status (incl. overdue
 -- and missed), tasks (overdue / today / upcoming / done), and past + upcoming meetings.
 
+-- ---------------------------------------------------------------- schema catch-up
+-- Your live DB was created before the later additions in schema.sql, so bring it up to
+-- date first. Every statement is guarded (if not exists / if exists) — safe to re-run.
+alter table companies add column if not exists outreach_status text
+  check (outreach_status in ('Not Contacted','DM Reply','DM No Reply','Call Successful','Call Failed'))
+  default 'Not Contacted';
+alter table companies add column if not exists project_stage text
+  check (project_stage in ('Onboarding','Active Project','Waiting on Client','Ready for Launch','Won Opportunity / Active Retainer'));
+alter table companies add column if not exists retainer_tier text
+  check (retainer_tier in ('maintenance','growth','full-service'));
+alter table milestones add column if not exists priority text not null default 'Medium' check (priority in ('Low','Medium','High'));
+alter table milestones add column if not exists progress smallint not null default 0 check (progress >= 0 and progress <= 100);
+alter table milestones drop constraint if exists milestones_status_check;
+alter table milestones add constraint milestones_status_check check (status in ('pending','in_progress','done','missed'));
+
 -- ---------------------------------------------------------------- companies
 insert into companies (id, name, lead_status, lead_score, website, site_condition, gbp, deal_value, company_email, company_phone, instagram, address, client_type, remarks, outreach_status, project_stage, retainer_tier, owner_id, created_at, updated_at) values
 ('de300000-0000-4000-8000-000000000001','Sharma Dental Clinic','Prospect',35,null,'No Site',false,45000,'contact@sharmadental.in','+91 98200 11223','sharmadentalmumbai','Andheri West, Mumbai, Maharashtra','not active','[DEMO] Found via Google Maps — no website at all, strong reviews (4.7★).','Not Contacted',null,null,(select id from profiles order by created_at limit 1), now() - interval '2 days', now() - interval '2 days'),
