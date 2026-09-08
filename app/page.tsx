@@ -8,9 +8,18 @@ import {
 } from 'lucide-react'
 import { startOfWeek, addDays, addWeeks, format, isSameDay } from 'date-fns'
 
-const stages = ['Prospect','Qualified Lead','Discovery Call','Proposal Agreement Sent','Close Call','Verbal Approval','Agreement Signed','Initial Payment Received','Closed & Onboarding','Future Opportunity','Lost Opportunity']
+// Sales stages live in the pipeline_stages table so they can be renamed/added from the Sales
+// board. This list seeds that table on first run and is the fallback if it can't be read.
+// `kind` marks the terminal columns — 'won' is what triggers the automatic handover into the
+// Projects delivery pipeline.
+const defaultStageRows: any[] = [
+  { name: 'Prospect', kind: 'open' }, { name: 'Qualified Lead', kind: 'open' }, { name: 'Discovery Call', kind: 'open' },
+  { name: 'Proposal Agreement Sent', kind: 'open' }, { name: 'Close Call', kind: 'open' }, { name: 'Verbal Approval', kind: 'open' },
+  { name: 'Agreement Signed', kind: 'open' }, { name: 'Initial Payment Received', kind: 'open' },
+  { name: 'Closed & Onboarding', kind: 'won' }, { name: 'Future Opportunity', kind: 'future' }, { name: 'Lost Opportunity', kind: 'lost' },
+].map((s, i) => ({ ...s, position: i + 1 }))
 // Outreach touches (DM/call) are a per-company field (see outreachStatuses below), not pipeline
-// columns — moved out of `stages` per the Outreach SOP and Atomeo's 2026-09-07 correction.
+// columns — moved out of the stage list per the Outreach SOP and Atomeo's 2026-09-07 correction.
 const outreachStatuses = ['Not Contacted', 'DM Reply', 'DM No Reply', 'Call Successful', 'Call Failed']
 const siteOptions = ['No Site','Not Working','Outdated','Not Good','Coming Soon / Under Construction','Decent','Good']
 const clientTypes = ['old','not active','active','very active']
@@ -22,11 +31,23 @@ const activityTypes = [
   { value: 'note', label: 'Note' },
 ]
 
-// Real post-payment delivery stages, confirmed against Vesper's own Onboarding / Execution &
-// Revision / Handover / Retainer SOPs — not invented. Deliberately separate from `stages`
-// (the sales pipeline) rather than replacing "Closed & Onboarding": that keeps this additive,
-// with no migration needed for existing companies.
-const projectStages = ['Onboarding', 'Active Project', 'Waiting on Client', 'Ready for Launch', 'Won Opportunity / Active Retainer']
+// The real Vesper delivery pipeline, as given by Atomeo (2026-09-08). A company enters at
+// 'Onboarding' automatically when Sales marks it closed-won, and from then on lives on the
+// Projects board instead of the Sales board. Numbers shown in the UI come from position here.
+const projectStages = [
+  'Onboarding',
+  'Round 1: Sitemap & Wireframe',
+  'Round 2: Structural Anchors',
+  'Round 2.5: Portfolio + Quiz (Premium only)',
+  'Build in Progress',
+  'Round 3: Full Site Review',
+  'Round 4: Live Revision Walkthrough',
+  'Final QA',
+  'Launch Prep',
+  'Live / Handover',
+  'Retainer Active / Project Closed',
+]
+const projectStageLabel = (s: string) => `${String(projectStages.indexOf(s) + 1).padStart(2, '0')} — ${s}`
 const retainerTiers = ['maintenance', 'growth', 'full-service']
 // Standard recurring goals per tier, taken directly from the Retainer SOP's tier tables —
 // Maintenance has no SOP-mandated recurring deliverable beyond the update allowance itself.
@@ -100,7 +121,26 @@ export default function Page() {
   const [showMeeting, setShowMeeting] = useState<any>(null)
   const [deletingId, setDeletingId] = useState<string | null>(null)
   const [aiQuery, setAiQuery] = useState<string | null>(null)
+  const [stageRows, setStageRows] = useState<any[]>(defaultStageRows)
   const searchRef = useRef<HTMLInputElement>(null)
+
+  const stageNames = useMemo(() => stageRows.map(s => s.name), [stageRows])
+  const wonStageNames = useMemo(() => stageRows.filter(s => s.kind === 'won').map(s => s.name), [stageRows])
+  const closedStageNames = useMemo(() => stageRows.filter(s => s.kind !== 'open').map(s => s.name), [stageRows])
+
+  async function loadStages() {
+    const { data, error } = await supabase.from('pipeline_stages').select('*').order('position')
+    // Table missing (migration not run yet) → keep the built-in defaults; editing will say so.
+    if (error) { setStageRows(defaultStageRows); return }
+    if (!data?.length) {
+      // Table exists but is empty — seed it once so every stage row has a real id.
+      const { data: seeded } = await supabase.from('pipeline_stages')
+        .insert(defaultStageRows.map(s => ({ name: s.name, kind: s.kind, position: s.position }))).select()
+      setStageRows(seeded?.length ? [...seeded].sort((a, b) => a.position - b.position) : defaultStageRows)
+      return
+    }
+    setStageRows(data)
+  }
 
   async function loadMeetings() {
     const { data: mt } = await supabase.from('meetings').select('*,companies(name)').order('starts_at', { ascending: true })
@@ -127,7 +167,7 @@ export default function Page() {
     ])
     setCompanies((comp || []).map((x: any) => ({ ...x, contact: x.contacts?.[0] || null })))
     setTasks(tk || [])
-    await Promise.all([loadMeetings(), loadGoogleConn()])
+    await Promise.all([loadMeetings(), loadGoogleConn(), loadStages()])
   }
 
   async function syncGoogleCalendar(manual = false) {
@@ -254,8 +294,49 @@ export default function Page() {
     return updated
   }
   async function handleStageChange(id: string, patch: any) {
+    // The Sales → Projects handover: landing on a closed-won stage starts the delivery
+    // pipeline at 'Onboarding', which also removes the company from the Sales board (the
+    // Sales view only shows companies without a project_stage). Never overwrites a delivery
+    // stage that's already set.
+    const company = companies.find(c => c.id === id)
+    if (patch.lead_status && wonStageNames.includes(patch.lead_status) && company && !company.project_stage) {
+      patch = { ...patch, project_stage: projectStages[0] }
+    }
     const updated = await updateCompany(id, patch)
     if (updated && selected?.id === id) setSelected(updated)
+  }
+
+  async function renameStage(stage: any) {
+    const name = prompt('Rename stage', stage.name)?.trim()
+    if (!name || name === stage.name) return
+    if (stageRows.some(s => s.name === name)) { alert('A stage with that name already exists.'); return }
+    if (!stage.id) { alert('Run supabase/migrate-pipeline.sql first — stages are still the built-in defaults.'); return }
+    const { error } = await supabase.from('pipeline_stages').update({ name }).eq('id', stage.id)
+    if (error) { alert(error.message); return }
+    // Companies carry the stage by name, so move them along with the rename.
+    const { error: cErr } = await supabase.from('companies').update({ lead_status: name }).eq('lead_status', stage.name)
+    if (cErr) { alert(cErr.message); return }
+    setStageRows(x => x.map(s => (s.id === stage.id ? { ...s, name } : s)))
+    setCompanies(x => x.map(c => (c.lead_status === stage.name ? { ...c, lead_status: name } : c)))
+    setSelected((s: any) => (s && s.lead_status === stage.name ? { ...s, lead_status: name } : s))
+  }
+
+  async function addStage() {
+    const name = prompt('New stage name')?.trim()
+    if (!name) return
+    if (stageRows.some(s => s.name === name)) { alert('That stage already exists.'); return }
+    if (!stageRows.some(s => s.id)) { alert('Run supabase/migrate-pipeline.sql first — stages are still the built-in defaults.'); return }
+    // New stages slot in before the terminal columns (won/lost/future stay at the end).
+    const firstClosed = [...stageRows].filter(s => s.kind !== 'open').sort((a, b) => a.position - b.position)[0]
+    const position = firstClosed ? firstClosed.position : Math.max(0, ...stageRows.map(s => s.position || 0)) + 1
+    if (firstClosed) {
+      await Promise.all(stageRows.filter(s => s.position >= position && s.id).map(s =>
+        supabase.from('pipeline_stages').update({ position: s.position + 1 }).eq('id', s.id)
+      ))
+    }
+    const { error } = await supabase.from('pipeline_stages').insert({ name, kind: 'open', position })
+    if (error) { alert(error.message); return }
+    await loadStages()
   }
   async function handleSaveNotes(id: string, remarks: string) {
     const updated = await updateCompany(id, { remarks })
@@ -336,7 +417,12 @@ export default function Page() {
   }
 
   async function saveEditedCompany(id: string, c: any) {
+    // Same handover rule as handleStageChange, for closes made through the edit form.
+    const existing = companies.find(z => z.id === id)
+    const handover = wonStageNames.includes(c.lead_status) && existing && !existing.project_stage
+      ? { project_stage: projectStages[0] } : {}
     const { error } = await supabase.from('companies').update({
+      ...handover,
       name: c.name, lead_status: c.lead_status, lead_score: c.lead_score, website: c.website,
       site_condition: c.site_condition, gbp: c.gbp, deal_value: c.deal_value,
       client_type: c.client_type, company_email: c.company_email, company_phone: c.company_phone,
@@ -490,16 +576,17 @@ export default function Page() {
           </div>
         </header>
         <div className="content">
-          {view === 'home' && <HomeView companies={companies} meetings={meetings} onOpen={(c: any) => { setSelected(c); setView('detail') }} onNew={() => setShowNew(true)} onGoCalendar={() => setView('calendar')} onDeleteMeeting={deleteMeeting} />}
-          {view === 'pipeline' && <Pipeline companies={filtered} onOpen={(c: any) => { setSelected(c); setView('detail') }} onUpdate={handleStageChange} onOutreachChange={updateOutreachStatus} />}
+          {view === 'home' && <HomeView companies={companies} meetings={meetings} closedStages={closedStageNames} onOpen={(c: any) => { setSelected(c); setView('detail') }} onNew={() => setShowNew(true)} onGoCalendar={() => setView('calendar')} onDeleteMeeting={deleteMeeting} />}
+          {view === 'pipeline' && <Pipeline companies={filtered.filter((c: any) => !c.project_stage)} stages={stageRows} onOpen={(c: any) => { setSelected(c); setView('detail') }} onUpdate={handleStageChange} onOutreachChange={updateOutreachStatus} onRenameStage={renameStage} onAddStage={addStage} />}
           {view === 'companies' && <Companies companies={aiMatches ?? filtered} onOpen={(c: any) => { setSelected(c); setView('detail') }} onNew={() => setShowNew(true)} onOutreachChange={updateOutreachStatus} />}
-          {view === 'projects' && <ProjectsView companies={companies} onToggleMilestone={toggleMilestone} onUpdateProgress={updateMilestoneProgress} onUpdateFields={updateMilestoneFields} onDeleteMilestone={deleteMilestone} onOpenCompany={(c: any) => { setSelected(c); setView('detail') }} />}
+          {view === 'projects' && <ProjectsView companies={companies} onToggleMilestone={toggleMilestone} onUpdateProgress={updateMilestoneProgress} onUpdateFields={updateMilestoneFields} onDeleteMilestone={deleteMilestone} onProjectStageChange={updateProjectStage} onOpenCompany={(c: any) => { setSelected(c); setView('detail') }} />}
           {view === 'calendar' && <CalendarView meetings={meetings} googleConn={googleConn} onSync={syncGoogleCalendar} onDeleteMeeting={deleteMeeting} />}
           {view === 'tasks' && <Tasks tasks={tasks} companies={companies} onToggle={toggleTask} onAdd={addTask} onDelete={deleteTask} />}
           {view === 'settings' && <SettingsView googleConn={googleConn} />}
           {view === 'detail' && selected && (
             <Detail
               c={selected}
+              stages={stageNames}
               onBack={() => setView('companies')}
               onUpdate={handleStageChange}
               onEdit={(c: any) => setEditCompany(c)}
@@ -529,8 +616,8 @@ export default function Page() {
         <Nav active={view === 'tasks'} icon={<CheckCircle2 />} label="Tasks" onClick={() => setView('tasks')} />
       </nav>
       <button className="ai-fab" onClick={() => { const v = prompt('Ask VESPER anything about your CRM'); if (v) { setAiQuery(v); setView('companies') } }}><Command /></button>
-      {showNew && <CompanyForm onClose={() => setShowNew(false)} onSave={addCompany} />}
-      {editCompany && <CompanyForm initial={editCompany} onClose={() => setEditCompany(null)} onSave={(f: any) => saveEditedCompany(editCompany.id, f)} />}
+      {showNew && <CompanyForm stages={stageNames} onClose={() => setShowNew(false)} onSave={addCompany} />}
+      {editCompany && <CompanyForm stages={stageNames} initial={editCompany} onClose={() => setEditCompany(null)} onSave={(f: any) => saveEditedCompany(editCompany.id, f)} />}
       {showActivity && <AddActivity company={showActivity} onClose={() => setShowActivity(null)} onSave={(a: any) => addActivity(showActivity, a)} />}
       {showMeeting && <NewMeetingForm company={showMeeting} onClose={() => setShowMeeting(null)} onSave={(m: any) => scheduleMeeting(showMeeting, m)} />}
       {aiMatches != null && <div className="toast"><b>VESPER found {aiMatches.length}</b><button onClick={() => setAiQuery(null)}><X /></button></div>}
@@ -542,16 +629,15 @@ function Nav({ active, icon, label, onClick }: { active: boolean; icon: any; lab
   return <button className={active ? 'nav active' : 'nav'} onClick={onClick}>{icon}<span>{label}</span></button>
 }
 
-function HomeView({ companies, meetings, onOpen, onNew, onGoCalendar, onDeleteMeeting }: { companies: any[]; meetings: any[]; onOpen: any; onNew: any; onGoCalendar: any; onDeleteMeeting: any }) {
+function HomeView({ companies, meetings, closedStages, onOpen, onNew, onGoCalendar, onDeleteMeeting }: { companies: any[]; meetings: any[]; closedStages: string[]; onOpen: any; onNew: any; onGoCalendar: any; onDeleteMeeting: any }) {
   const upcoming = meetings.filter(m => new Date(m.starts_at) >= new Date(Date.now() - 3600000)).sort((a, b) => a.starts_at.localeCompare(b.starts_at))
   const qualified = companies.filter(c => c.lead_status === 'Qualified Lead').length
 
   // Real stalled-opportunity detection, replacing the placeholder card that used to claim this
-  // existed. "Stalled" = an open (not closed/lost/future) company with no logged activity, and
-  // no update to the record itself, in the last 14 days.
-  const closedStages = ['Closed & Onboarding', 'Lost Opportunity', 'Future Opportunity']
+  // existed. "Stalled" = an open (not closed/lost/future, not handed to delivery) company with
+  // no logged activity, and no update to the record itself, in the last 14 days.
   const stalled = companies
-    .filter(c => !closedStages.includes(c.lead_status))
+    .filter(c => !closedStages.includes(c.lead_status) && !c.project_stage)
     .map(c => {
       const lastActivity = (c.activities || []).reduce((max: string | null, a: any) => (!max || a.occurred_at > max) ? a.occurred_at : max, null)
       const lastTouch = lastActivity || c.updated_at
@@ -618,15 +704,21 @@ function Attention({ icon, title, text, onClick }: { icon: any; title: string; t
 function Empty({ title, text }: { title: string; text: string }) { return <div className="empty"><b>{title}</b><p>{text}</p></div> }
 function Status({ s }: { s: string }) { return <span className={'status ' + s.toLowerCase().replaceAll(' ', '-')}>{s}</span> }
 
-function Pipeline({ companies, onOpen, onUpdate, onOutreachChange }: { companies: any[]; onOpen: any; onUpdate: any; onOutreachChange: any }) {
+function Pipeline({ companies, stages, onOpen, onUpdate, onOutreachChange, onRenameStage, onAddStage }: { companies: any[]; stages: any[]; onOpen: any; onUpdate: any; onOutreachChange: any; onRenameStage: any; onAddStage: any }) {
   const [dragId, setDragId] = useState<string | null>(null)
   return (
     <>
-      <div className="page-title"><div><div className="eyebrow">SALES</div><h1>Opportunity flow.</h1><p>Business progress stays here. Outreach actions live in the timeline.</p></div></div>
+      <div className="page-title"><div><div className="eyebrow">SALES</div><h1>Opportunity flow.</h1><p>Close a deal and the company hands over to Projects automatically.</p></div></div>
       <div className="kanban">
-        {stages.map(stage => (
+        {stages.map((s: any) => { const stage = s.name; return (
           <div className="column" key={stage} onDragOver={e => e.preventDefault()} onDrop={e => { e.preventDefault(); if (dragId) onUpdate(dragId, { lead_status: stage }); setDragId(null) }}>
-            <div className="col-head"><b>{stage}</b><span>{companies.filter(c => c.lead_status === stage).length}</span></div>
+            <div className="col-head">
+              <b>{stage}</b>
+              <span className="col-tools">
+                <button className="col-edit" title="Rename stage" onClick={() => onRenameStage(s)}><Pencil /></button>
+                {companies.filter(c => c.lead_status === stage).length}
+              </span>
+            </div>
             {companies.filter(c => c.lead_status === stage).map(c => (
               <div className="deal-card" key={c.id} draggable onDragStart={() => setDragId(c.id)} onDragEnd={() => setDragId(null)} onClick={() => onOpen(c)}>
                 <div className="card-top"><b>{c.name}</b><span>{c.lead_score}</span></div>
@@ -643,7 +735,10 @@ function Pipeline({ companies, onOpen, onUpdate, onOutreachChange }: { companies
               </div>
             ))}
           </div>
-        ))}
+        )})}
+        <div className="column">
+          <button className="ghost add-stage" onClick={onAddStage}><Plus /> Add stage</button>
+        </div>
       </div>
     </>
   )
@@ -690,7 +785,7 @@ function Companies({ companies, onOpen, onNew, onOutreachChange }: { companies: 
   )
 }
 
-function Detail({ c, onBack, onUpdate, onEdit, onDelete, onAddActivity, onScheduleMeeting, onSaveNotes, deleting, onOutreachChange, onProjectStageChange, onRetainerTierChange, onAddMilestone, onToggleMilestone, onApplyTemplate, onUpdateMilestoneProgress, onDeleteMilestone }: { c: any; onBack: any; onUpdate: any; onEdit: any; onDelete: any; onAddActivity: any; onScheduleMeeting: any; onSaveNotes: any; deleting?: boolean; onOutreachChange: any; onProjectStageChange: any; onRetainerTierChange: any; onAddMilestone: any; onToggleMilestone: any; onApplyTemplate: any; onUpdateMilestoneProgress: any; onDeleteMilestone: any }) {
+function Detail({ c, stages, onBack, onUpdate, onEdit, onDelete, onAddActivity, onScheduleMeeting, onSaveNotes, deleting, onOutreachChange, onProjectStageChange, onRetainerTierChange, onAddMilestone, onToggleMilestone, onApplyTemplate, onUpdateMilestoneProgress, onDeleteMilestone }: { c: any; stages: string[]; onBack: any; onUpdate: any; onEdit: any; onDelete: any; onAddActivity: any; onScheduleMeeting: any; onSaveNotes: any; deleting?: boolean; onOutreachChange: any; onProjectStageChange: any; onRetainerTierChange: any; onAddMilestone: any; onToggleMilestone: any; onApplyTemplate: any; onUpdateMilestoneProgress: any; onDeleteMilestone: any }) {
   const [tab, setTab] = useState('overview')
   const [notes, setNotes] = useState(c.remarks || '')
   useEffect(() => { setNotes(c.remarks || '') }, [c.id])
@@ -734,7 +829,7 @@ function Detail({ c, onBack, onUpdate, onEdit, onDelete, onAddActivity, onSchedu
                 </select>
               </label>
             </div>
-            <Info label="Lead status" value={c.lead_status} /><Info label="Lead score" value={`${c.lead_score}/100`} /><Info label="Website condition" value={c.site_condition} /><Info label="GBP" value={c.gbp ? 'Yes' : 'No'} /><Info label="Deal value" value={money(c.deal_value)} /><Info label="Client type" value={c.client_type} /><Info label="Email" value={c.company_email} /><Info label="Phone" value={c.company_phone} /><Info label="Address" value={c.address} /><Info label="Remarks" value={c.remarks} />
+            <Info label="Lead status" value={c.lead_status} /><Info label="Lead score" value={`${c.lead_score}/100`} /><Info label="Website condition" value={c.site_condition} /><Info label="GBP" value={c.gbp ? 'Yes' : 'No'} /><Info label="Deal value" value={money(c.deal_value)} /><Info label="Client type" value={c.client_type} /><Info label="Email" value={c.company_email} /><Info label="Phone" value={c.company_phone} /><Info label="Address" value={c.address} /><Info label="Notes" value={c.remarks} />
           </section>
           <section className="panel">
             <div className="panel-head"><h2>Founder / decision maker</h2></div>
@@ -802,7 +897,7 @@ function ProjectPanel({ c, onStageChange, onTierChange, onAddMilestone, onToggle
             <label>Stage (post-close)
               <select value={c.project_stage || ''} onChange={e => onStageChange(c.id, e.target.value)}>
                 <option value="">— not started —</option>
-                {projectStages.map(s => <option key={s} value={s}>{s}</option>)}
+                {projectStages.map(s => <option key={s} value={s}>{projectStageLabel(s)}</option>)}
               </select>
             </label>
           </div>
@@ -994,8 +1089,10 @@ function Tasks({ tasks, companies, onToggle, onAdd, onDelete }: { tasks: any[]; 
   )
 }
 
-function ProjectsView({ companies, onToggleMilestone, onUpdateProgress, onUpdateFields, onDeleteMilestone, onOpenCompany }: { companies: any[]; onToggleMilestone: any; onUpdateProgress: any; onUpdateFields: any; onDeleteMilestone: any; onOpenCompany: any }) {
-  const [mode, setMode] = useState<'board' | 'table'>('board')
+function ProjectsView({ companies, onToggleMilestone, onUpdateProgress, onUpdateFields, onDeleteMilestone, onProjectStageChange, onOpenCompany }: { companies: any[]; onToggleMilestone: any; onUpdateProgress: any; onUpdateFields: any; onDeleteMilestone: any; onProjectStageChange: any; onOpenCompany: any }) {
+  const [mode, setMode] = useState<'clients' | 'board' | 'table'>('clients')
+  const [dragC, setDragC] = useState<string | null>(null)
+  const clients = companies.filter((c: any) => c.project_stage)
   const [statusFilter, setStatusFilter] = useState('all')
   const [priorityFilter, setPriorityFilter] = useState('all')
   const [companyFilter, setCompanyFilter] = useState('all')
@@ -1019,16 +1116,17 @@ function ProjectsView({ companies, onToggleMilestone, onUpdateProgress, onUpdate
   }
   return (
     <>
-      <div className="page-title"><div><div className="eyebrow">ALL CLIENTS</div><h1>Projects.</h1><p>Every open goal and deliverable, across every company, in one place.</p></div></div>
+      <div className="page-title"><div><div className="eyebrow">DELIVERY</div><h1>Projects.</h1><p>Closed clients move through the delivery pipeline here — tasks live on the Tasks board.</p></div></div>
       <div className="filterbar">
         <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
           <div className="view-toggle">
-            <button className={mode === 'board' ? 'active' : ''} onClick={() => setMode('board')}>Board</button>
+            <button className={mode === 'clients' ? 'active' : ''} onClick={() => setMode('clients')}>Clients</button>
+            <button className={mode === 'board' ? 'active' : ''} onClick={() => setMode('board')}>Tasks</button>
             <button className={mode === 'table' ? 'active' : ''} onClick={() => setMode('table')}>Table</button>
           </div>
-          <span>{filtered.length} task{filtered.length === 1 ? '' : 's'}</span>
+          <span>{mode === 'clients' ? `${clients.length} client${clients.length === 1 ? '' : 's'}` : `${filtered.length} task${filtered.length === 1 ? '' : 's'}`}</span>
         </div>
-        <div style={{ display: 'flex', gap: 8 }}>
+        {mode !== 'clients' && <div style={{ display: 'flex', gap: 8 }}>
           <select value={companyFilter} onChange={e => setCompanyFilter(e.target.value)}>
             <option value="all">All companies</option>
             {withTasks.map((c: any) => <option key={c.id} value={c.id}>{c.name}</option>)}
@@ -1045,10 +1143,35 @@ function ProjectsView({ companies, onToggleMilestone, onUpdateProgress, onUpdate
             <option value="Medium">Medium</option>
             <option value="High">High</option>
           </select>
-        </div>
+        </div>}
       </div>
-      {!all.length ? (
-        <Empty title="No projects yet" text="Add goals or deliverables from a company's Project tab." />
+      {mode === 'clients' ? (
+        clients.length ? (
+          <div className="kanban">
+            {projectStages.map((stage, i) => {
+              const items = clients.filter((c: any) => c.project_stage === stage)
+              return (
+                <div className="column" key={stage} onDragOver={e => e.preventDefault()} onDrop={e => { e.preventDefault(); if (dragC) onProjectStageChange(dragC, stage); setDragC(null) }}>
+                  <div className="col-head"><b>{String(i + 1).padStart(2, '0')} — {stage}</b><span>{items.length}</span></div>
+                  {items.map((c: any) => {
+                    const ms = c.milestones || []
+                    const done = ms.filter((m: any) => m.status === 'done').length
+                    const avg = ms.length ? Math.round(ms.reduce((s: number, m: any) => s + (m.progress ?? 0), 0) / ms.length) : 0
+                    return (
+                      <div className="deal-card" key={c.id} draggable onDragStart={() => setDragC(c.id)} onDragEnd={() => setDragC(null)} onClick={() => onOpenCompany(c)}>
+                        <div className="card-top"><b>{c.name}</b>{c.retainer_tier ? <span>{c.retainer_tier}</span> : null}</div>
+                        <p>{ms.length ? `${done}/${ms.length} tasks done` : 'No tasks yet'}</p>
+                        {ms.length ? <div className="progress-track"><div className="progress-fill" style={{ width: `${avg}%` }} /></div> : null}
+                      </div>
+                    )
+                  })}
+                </div>
+              )
+            })}
+          </div>
+        ) : <Empty title="No clients in delivery yet" text="Close a deal on the Sales board and the company lands here automatically." />
+      ) : !all.length ? (
+        <Empty title="No tasks yet" text="Add goals or deliverables from a company's Project tab." />
       ) : mode === 'board' ? (
         <div className="kanban">
           {columns.map(col => {
@@ -1175,7 +1298,7 @@ function SettingsView({ googleConn }: { googleConn: any }) {
   )
 }
 
-function CompanyForm({ initial, onClose, onSave }: { initial?: any; onClose: () => void; onSave: (c: any) => void }) {
+function CompanyForm({ stages, initial, onClose, onSave }: { stages: string[]; initial?: any; onClose: () => void; onSave: (c: any) => void }) {
   const [f, setF] = useState<any>(initial ? {
     name: initial.name || '', lead_status: initial.lead_status || 'Prospect', lead_score: initial.lead_score ?? 50,
     website: initial.website || '', site_condition: initial.site_condition || 'Outdated', gbp: !!initial.gbp,

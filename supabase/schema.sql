@@ -208,3 +208,37 @@ alter table milestones add column if not exists priority text not null default '
 alter table milestones add column if not exists progress smallint not null default 0 check (progress >= 0 and progress <= 100);
 alter table milestones drop constraint if exists milestones_status_check;
 alter table milestones add constraint milestones_status_check check (status in ('pending','in_progress','done','missed'));
+
+-- 2026-09-08: editable sales pipeline + real 11-step delivery pipeline + Sales→Projects
+-- handover. Same statements as supabase/migrate-pipeline.sql (kept there for existing DBs).
+create table if not exists pipeline_stages (
+ id uuid primary key default gen_random_uuid(),
+ name text not null unique,
+ kind text not null default 'open' check (kind in ('open','won','lost','future')),
+ position int not null,
+ created_at timestamptz not null default now()
+);
+alter table pipeline_stages enable row level security;
+drop policy if exists "authenticated pipeline_stages" on pipeline_stages;
+create policy "authenticated pipeline_stages" on pipeline_stages for all to authenticated using (true) with check (true);
+insert into pipeline_stages (name, kind, position) values
+ ('Prospect','open',1),('Qualified Lead','open',2),('Discovery Call','open',3),
+ ('Proposal Agreement Sent','open',4),('Close Call','open',5),('Verbal Approval','open',6),
+ ('Agreement Signed','open',7),('Initial Payment Received','open',8),
+ ('Closed & Onboarding','won',9),('Future Opportunity','future',10),('Lost Opportunity','lost',11)
+on conflict (name) do nothing;
+update companies set project_stage = case project_stage
+ when 'Active Project' then 'Build in Progress'
+ when 'Waiting on Client' then 'Build in Progress'
+ when 'Ready for Launch' then 'Launch Prep'
+ when 'Won Opportunity / Active Retainer' then 'Retainer Active / Project Closed'
+ else project_stage end
+where project_stage is not null;
+alter table companies drop constraint if exists companies_project_stage_check;
+alter table companies add constraint companies_project_stage_check check (project_stage in (
+ 'Onboarding','Round 1: Sitemap & Wireframe','Round 2: Structural Anchors',
+ 'Round 2.5: Portfolio + Quiz (Premium only)','Build in Progress','Round 3: Full Site Review',
+ 'Round 4: Live Revision Walkthrough','Final QA','Launch Prep','Live / Handover',
+ 'Retainer Active / Project Closed'));
+update companies set project_stage = 'Onboarding'
+where project_stage is null and lead_status = 'Closed & Onboarding';
