@@ -746,6 +746,28 @@ function HomeView({ companies, meetings, closedStages, onOpen, onNew, onGoCalend
 }
 // Shown on any meeting that isn't attached to a company yet — i.e. everything Google sync
 // pulled in. Stops click-through so using it inside a clickable card doesn't navigate away.
+// Commits on blur or Enter rather than on every keystroke. As a number input, holding an arrow
+// key or typing "100" fired one DB write per character — the task title input in the table view
+// was already built this way for exactly this reason; this brings the percentage field in line.
+function ProgressInput({ value, onCommit }: { value: number; onCommit: (v: number) => void }) {
+  const [draft, setDraft] = useState(String(value))
+  // Re-sync when the value changes underneath us (another edit, or a failed write rolling back).
+  useEffect(() => { setDraft(String(value)) }, [value])
+  function commit() {
+    const n = Math.max(0, Math.min(100, Math.round(+draft || 0)))
+    setDraft(String(n))
+    if (n !== value) onCommit(n)
+  }
+  return (
+    <input
+      type="number" min={0} max={100} value={draft}
+      onChange={e => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={e => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
+    />
+  )
+}
+
 function MeetingCompanyPicker({ meeting, companies, onLink, compact }: { meeting: any; companies: any[]; onLink: any; compact?: boolean }) {
   return (
     <select
@@ -1028,7 +1050,7 @@ function ProjectPanel({ c, onStageChange, onTierChange, onAddMilestone, onToggle
                       </div>
                       <div className="progress-track"><div className="progress-fill" style={{ width: `${m.progress ?? 0}%` }} /></div>
                       <div className="progress-row">
-                        <input type="number" min={0} max={100} value={m.progress ?? 0} onChange={e => onUpdateProgress(c.id, m.id, Math.max(0, Math.min(100, +e.target.value || 0)))} />
+                        <ProgressInput value={m.progress ?? 0} onCommit={v => onUpdateProgress(c.id, m.id, v)} />
                         <span>% complete</span>
                       </div>
                     </div>
@@ -1265,7 +1287,7 @@ function ProjectsView({ companies, onToggleMilestone, onUpdateProgress, onUpdate
                     </div>
                     <div className="progress-track"><div className="progress-fill" style={{ width: `${m.progress ?? 0}%` }} /></div>
                     <div className="progress-row">
-                      <input type="number" min={0} max={100} value={m.progress ?? 0} onChange={e => onUpdateProgress(m.companyId, m.id, Math.max(0, Math.min(100, +e.target.value || 0)))} />
+                      <ProgressInput value={m.progress ?? 0} onCommit={v => onUpdateProgress(m.companyId, m.id, v)} />
                       <span>% complete</span>
                     </div>
                   </div>
@@ -1312,7 +1334,7 @@ function ProjectsView({ companies, onToggleMilestone, onUpdateProgress, onUpdate
                     </td>
                     <td>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                        <input type="number" min={0} max={100} value={m.progress ?? 0} onChange={e => onUpdateProgress(m.companyId, m.id, Math.max(0, Math.min(100, +e.target.value || 0)))} />
+                        <ProgressInput value={m.progress ?? 0} onCommit={v => onUpdateProgress(m.companyId, m.id, v)} />
                         <div className="progress-track" style={{ width: 64 }}><div className="progress-fill" style={{ width: `${m.progress ?? 0}%` }} /></div>
                       </div>
                     </td>
