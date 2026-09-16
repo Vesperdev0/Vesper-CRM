@@ -1,5 +1,11 @@
 create extension if not exists pgcrypto;
 
+-- Defined up here, not next to the companies/contacts/meetings triggers further down:
+-- the milestones trigger references it ~30 lines earlier than that, and Postgres resolves
+-- the function at CREATE TRIGGER time. With the old ordering a fresh database aborted on
+-- `function set_updated_at() does not exist`, so this file had never actually run clean.
+create or replace function set_updated_at() returns trigger language plpgsql as $$ begin new.updated_at = now(); return new; end $$;
+
 create table if not exists profiles (
  id uuid primary key references auth.users(id) on delete cascade,
  username text unique,
@@ -198,7 +204,6 @@ select id, coalesce(raw_user_meta_data->>'username', split_part(email,'@',1)), c
 from auth.users
 on conflict (id) do nothing;
 
-create or replace function set_updated_at() returns trigger language plpgsql as $$ begin new.updated_at = now(); return new; end $$;
 create or replace trigger companies_updated before update on companies for each row execute function set_updated_at();
 create or replace trigger contacts_updated before update on contacts for each row execute function set_updated_at();
 create or replace trigger opp_updated before update on opportunities for each row execute function set_updated_at();
