@@ -64,6 +64,29 @@ const milestoneStatuses: { key: string; label: string }[] = [
 const bucketOfMilestone = (m: any) => (m.status === 'in_progress' ? 'in_progress' : m.status === 'done' ? 'done' : 'pending')
 
 const retainerTiers = ['maintenance', 'growth', 'full-service']
+
+// Retainer engagement tiers. Title case, matching the retainers.tier check constraint and the
+// SOP's own client-facing wording. NOT the same list as retainerTiers above, which is the legacy
+// lowercase companies.retainer_tier column being retired under the drop-unused workstream.
+//
+// These amounts only PREFILL the form. retainers.monthly_amount stores what was actually agreed
+// for that engagement, so repricing a tier later never rewrites an existing retainer.
+const retainerTierDefaults: Record<string, number> = {
+  'Maintenance': 2500,
+  'Growth': 6500,
+  'Full-Service': 12500,
+}
+const retainerTierNames = Object.keys(retainerTierDefaults)
+const retainerStatusLabels: Record<string, string> = {
+  pending: 'Pending first invoice',
+  active: 'Active',
+  paused: 'Paused',
+  churned: 'Churned',
+}
+// Conversion is gated on delivery actually being finished. Reaching this stage only REVEALS the
+// action — it creates nothing on its own. A retainer row exists once an agreement date is
+// captured, and goes Active only once a first invoice date is.
+const RETAINER_GATE_STAGE = 'Live / Handover'
 // Standard recurring goals per tier, taken directly from the Retainer SOP's tier tables —
 // Maintenance has no SOP-mandated recurring deliverable beyond the update allowance itself.
 const retainerGoalTemplates: Record<string, { title: string; cadence: string }[]> = {
@@ -80,6 +103,16 @@ const retainerGoalTemplates: Record<string, { title: string; cadence: string }[]
     { title: 'Quarterly page refresh', cadence: 'quarterly' },
     { title: 'Monthly blog / case-study post', cadence: 'monthly' },
   ],
+}
+
+// retainerGoalTemplates is keyed lowercase ('growth'); retainers.tier is Title Case ('Growth').
+// Normalise at the lookup instead of changing either side — the stored enum is client-facing text
+// that matches the SOP, and the lowercase keys are the outlier. A direct index would miss
+// silently and just render no goals, which is exactly the kind of failure nobody reports.
+function goalTemplateFor(tier: string | null | undefined) {
+  if (!tier) return []
+  const key = Object.keys(retainerGoalTemplates).find(k => k.toLowerCase() === tier.toLowerCase())
+  return key ? retainerGoalTemplates[key] : []
 }
 
 function money(n: number | null) {
@@ -148,6 +181,8 @@ export default function Page() {
   const [meetings, setMeetings] = useState<any[]>([])
   const [googleConn, setGoogleConn] = useState<any>(null)
   const [profile, setProfile] = useState<any>(null)
+  const [liveRetainers, setLiveRetainers] = useState<any[]>([])
+  const [convertTarget, setConvertTarget] = useState<any>(null)
   const [view, setView] = useState('home')
   const [selected, setSelected] = useState<any>(null)
   // Where opening this company came from, so the detail page's back button returns there
@@ -194,6 +229,17 @@ export default function Page() {
   // Settings used to state flatly that "Roles are stored in your VESPER profiles" while
   // nothing in the app had ever read profiles. Read the real row so the claim is true, and so
   // an account that hasn't been approved yet can be told that instead of seeing empty boards.
+  // Always current_retainers, never the retainers table directly. Reading the raw table without
+  // a status filter silently sums churned engagements into live revenue — see the view's comment
+  // in supabase/migrate-retainers.sql. The view is the only sanctioned read path.
+  async function loadRetainers() {
+    const { data, error } = await supabase.from('current_retainers').select('*')
+    // Table/view missing (migration not applied) → no retainers, and the UI just won't offer it.
+    if (error) { setLiveRetainers([]); return }
+    setLiveRetainers(data || [])
+  }
+  const retainerFor = (companyId: string) => liveRetainers.find(r => r.company_id === companyId) || null
+
   async function loadProfile() {
     const { data: auth } = await supabase.auth.getUser()
     if (!auth.user) { setProfile(null); return }
@@ -222,7 +268,7 @@ export default function Page() {
     ])
     setCompanies((comp || []).map((x: any) => ({ ...x, contact: x.contacts?.[0] || null })))
     setTasks(tk || [])
-    await Promise.all([loadMeetings(), loadGoogleConn(), loadStages(), loadProfile()])
+    await Promise.all([loadMeetings(), loadGoogleConn(), loadStages(), loadProfile(), loadRetainers()])
   }
 
   async function syncGoogleCalendar(manual = false) {
@@ -335,7 +381,7 @@ export default function Page() {
   }
   async function logout() {
     await supabase.auth.signOut()
-    setUser(null); setCompanies([]); setTasks([]); setMeetings([]); setProfile(null); setSelected(null); setAiQuery(null); setView('home')
+    setUser(null); setCompanies([]); setTasks([]); setMeetings([]); setProfile(null); setLiveRetainers([]); setSelected(null); setAiQuery(null); setView('home')
   }
 
   async function addCompany(c: any) {
@@ -472,6 +518,51 @@ export default function Page() {
     const updated = await updateCompany(id, { retainer_tier: retainer_tier || null })
     if (updated && selected?.id === id) setSelected(updated)
   }
+  // Creates the engagement. Status is NOT passed — the database decides it: the row defaults to
+  // 'pending', and the activation trigger flips it to 'active' and stamps started_at,
+  // billing_anchor and next_invoice_due only if a first-invoice date came with it. Sending a
+  // status from here would be the client asserting a billing state it cannot actually know.
+  //
+  // Dates go through as the raw 'YYYY-MM-DD' strings the date inputs produce. Deliberately no
+  // Date parsing or toISOString() — these are calendar dates, and round-tripping them through a
+  // timestamp is how an agreement signed on the 1st becomes the 30th of the previous month.
+  async function convertToRetainer(company: any, f: { tier: string; monthly_amount: number; agreement_signed_on: string; first_invoice_issued_on?: string | null }) {
+    const { data, error } = await supabase.from('retainers').insert({
+      company_id: company.id,
+      tier: f.tier,
+      monthly_amount: f.monthly_amount,
+      agreement_signed_on: f.agreement_signed_on,
+      first_invoice_issued_on: f.first_invoice_issued_on || null,
+    }).select().single()
+    if (error) { alert(error.message); return }
+    await loadRetainers()
+    setConvertTarget(null)
+    const { data: auth } = await supabase.auth.getUser()
+    await supabase.from('activities').insert({
+      company_id: company.id, user_id: auth.user?.id, type: 'system',
+      title: data.status === 'active'
+        ? `Retainer started — ${f.tier} at ${money(f.monthly_amount)}/mo`
+        : `Retainer agreement signed — ${f.tier} at ${money(f.monthly_amount)}/mo (awaiting first invoice)`,
+    })
+    await refetchCompany(company.id, selected?.id === company.id)
+  }
+
+  // The deferred half of conversion. Filling in the first invoice date is what the trigger reacts
+  // to, so this sends only that one field and reads the resulting dates back rather than
+  // computing them client-side.
+  async function recordFirstInvoice(retainer: any, issuedOn: string) {
+    const { data, error } = await supabase.from('retainers')
+      .update({ first_invoice_issued_on: issuedOn }).eq('id', retainer.id).select().single()
+    if (error) { alert(error.message); return }
+    await loadRetainers()
+    const { data: auth } = await supabase.auth.getUser()
+    await supabase.from('activities').insert({
+      company_id: retainer.company_id, user_id: auth.user?.id, type: 'system',
+      title: `First retainer invoice issued — billing anchored to ${fmtDate(data.billing_anchor)}, next due ${fmtDate(data.next_invoice_due)}`,
+    })
+    await refetchCompany(retainer.company_id, selected?.id === retainer.company_id)
+  }
+
   function patchMilestonesLocally(companyId: string, fn: (ms: any[]) => any[]) {
     setCompanies(x => x.map(c => (c.id === companyId ? { ...c, milestones: fn(c.milestones || []) } : c)))
     setSelected((s: any) => (s && s.id === companyId ? { ...s, milestones: fn(s.milestones || []) } : s))
@@ -520,7 +611,7 @@ export default function Page() {
   // and inserted blindly before, so a second click silently produced a duplicate of every
   // standard goal — and nothing in the UI hinted that it already ran once.
   async function applyRetainerTemplate(company: any, tier: string) {
-    const template = retainerGoalTemplates[tier] || []
+    const template = goalTemplateFor(tier)
     if (!template.length) return
     const existing = new Set((company.milestones || []).map((m: any) => m.title))
     const missing = template.filter(t => !existing.has(t.title))
@@ -724,6 +815,9 @@ export default function Page() {
               onOutreachChange={updateOutreachStatus}
               onProjectStageChange={updateProjectStage}
               onRetainerTierChange={updateRetainerTier}
+              retainer={retainerFor(selected.id)}
+              onConvertRetainer={(c: any) => setConvertTarget(c)}
+              onRecordFirstInvoice={recordFirstInvoice}
               onAddMilestone={addMilestone}
               onToggleMilestone={toggleMilestone}
               onApplyTemplate={applyRetainerTemplate}
@@ -746,6 +840,7 @@ export default function Page() {
       {editCompany && <CompanyForm stages={stageNames} initial={editCompany} onClose={() => setEditCompany(null)} onSave={(f: any) => saveEditedCompany(editCompany.id, f)} />}
       {showActivity && <AddActivity company={showActivity} onClose={() => setShowActivity(null)} onSave={(a: any) => addActivity(showActivity, a)} />}
       {showMeeting && <NewMeetingForm company={showMeeting} onClose={() => setShowMeeting(null)} onSave={(m: any) => scheduleMeeting(showMeeting, m)} />}
+      {convertTarget && <ConvertToRetainerForm company={convertTarget} onClose={() => setConvertTarget(null)} onSave={(f: any) => convertToRetainer(convertTarget, f)} />}
       {aiResult && (
         <div className="toast">
           {aiResult.matches
@@ -988,7 +1083,7 @@ function Companies({ companies, onOpen, onNew, onOutreachChange }: { companies: 
   )
 }
 
-function Detail({ c, stages, onBack, backLabel, onUpdate, onEdit, onDelete, onAddActivity, onScheduleMeeting, onSaveNotes, deleting, onOutreachChange, onProjectStageChange, onRetainerTierChange, onAddMilestone, onToggleMilestone, onApplyTemplate, onUpdateMilestoneProgress, onDeleteMilestone }: { c: any; stages: string[]; onBack: any; backLabel: string; onUpdate: any; onEdit: any; onDelete: any; onAddActivity: any; onScheduleMeeting: any; onSaveNotes: any; deleting?: boolean; onOutreachChange: any; onProjectStageChange: any; onRetainerTierChange: any; onAddMilestone: any; onToggleMilestone: any; onApplyTemplate: any; onUpdateMilestoneProgress: any; onDeleteMilestone: any }) {
+function Detail({ c, stages, onBack, backLabel, onUpdate, onEdit, onDelete, onAddActivity, onScheduleMeeting, onSaveNotes, deleting, onOutreachChange, onProjectStageChange, onRetainerTierChange, retainer, onConvertRetainer, onRecordFirstInvoice, onAddMilestone, onToggleMilestone, onApplyTemplate, onUpdateMilestoneProgress, onDeleteMilestone }: { c: any; stages: string[]; onBack: any; backLabel: string; onUpdate: any; onEdit: any; onDelete: any; onAddActivity: any; onScheduleMeeting: any; onSaveNotes: any; deleting?: boolean; onOutreachChange: any; onProjectStageChange: any; onRetainerTierChange: any; retainer: any; onConvertRetainer: any; onRecordFirstInvoice: any; onAddMilestone: any; onToggleMilestone: any; onApplyTemplate: any; onUpdateMilestoneProgress: any; onDeleteMilestone: any }) {
   const [tab, setTab] = useState('overview')
   const [notes, setNotes] = useState(c.remarks || '')
   useEffect(() => { setNotes(c.remarks || '') }, [c.id])
@@ -1052,6 +1147,9 @@ function Detail({ c, stages, onBack, backLabel, onUpdate, onEdit, onDelete, onAd
       ) : tab === 'project' ? (
         <ProjectPanel
           c={c}
+          retainer={retainer}
+          onConvertRetainer={onConvertRetainer}
+          onRecordFirstInvoice={onRecordFirstInvoice}
           onStageChange={onProjectStageChange}
           onTierChange={onRetainerTierChange}
           onAddMilestone={onAddMilestone}
@@ -1071,7 +1169,83 @@ function Detail({ c, stages, onBack, backLabel, onUpdate, onEdit, onDelete, onAd
 }
 function Info({ label, value }: { label: string; value: any }) { return <div className="info"><span>{label}</span><b>{value || '—'}</b></div> }
 
-function ProjectPanel({ c, onStageChange, onTierChange, onAddMilestone, onToggleMilestone, onApplyTemplate, onUpdateProgress, onDeleteMilestone }: { c: any; onStageChange: (id: string, stage: string) => void; onTierChange: (id: string, tier: string) => void; onAddMilestone: (c: any, m: any) => void; onToggleMilestone: (companyId: string, milestoneId: string, status: string) => void; onApplyTemplate: (c: any, tier: string) => void; onUpdateProgress: (companyId: string, milestoneId: string, progress: number) => void; onDeleteMilestone: (companyId: string, milestoneId: string) => void }) {
+// The conversion gate and the retainer summary, on the company's Project tab.
+//
+// Three states, and the distinction between the first two is the whole point of the design:
+//   - no retainer, not at the gate stage  → explain what unlocks it, offer nothing
+//   - no retainer, at 'Live / Handover'   → offer the action. Arriving here creates NOTHING.
+//   - retainer exists                     → summarise it; if pending, offer the first invoice
+function RetainerBlock({ c, retainer, onConvert, onRecordFirstInvoice }: { c: any; retainer: any; onConvert: (c: any) => void; onRecordFirstInvoice: (r: any, d: string) => void }) {
+  const [invoiceDate, setInvoiceDate] = useState('')
+  const [saving, setSaving] = useState(false)
+
+  if (!retainer) {
+    const atGate = c.project_stage === RETAINER_GATE_STAGE
+    return atGate ? (
+      <>
+        <p style={{ fontSize: 11, color: 'var(--muted)', margin: '0 0 10px' }}>
+          Delivery is complete. Converting records the signed agreement — it does not assume the
+          client is being billed yet.
+        </p>
+        <button className="primary" onClick={() => onConvert(c)}><Plus /> Convert to Retainer</button>
+      </>
+    ) : (
+      <p style={{ fontSize: 11, color: 'var(--muted)', margin: 0 }}>
+        Available once this company reaches <b>{RETAINER_GATE_STAGE}</b>. Never straight from Sales
+        — the project has to be delivered first.
+      </p>
+    )
+  }
+
+  async function submitInvoice() {
+    if (!invoiceDate) { alert('Pick the date the first invoice was issued.'); return }
+    if (invoiceDate < retainer.agreement_signed_on) {
+      alert('The first invoice cannot predate the agreement.'); return
+    }
+    setSaving(true)
+    await onRecordFirstInvoice(retainer, invoiceDate)
+    setSaving(false)
+    setInvoiceDate('')
+  }
+
+  return (
+    <>
+      <Info label="Tier" value={retainer.tier} />
+      <Info label="Monthly" value={money(retainer.monthly_amount)} />
+      <Info label="Status" value={retainerStatusLabels[retainer.status] || retainer.status} />
+      <Info label="Agreement signed" value={fmtDate(retainer.agreement_signed_on)} />
+      {retainer.status === 'pending' ? (
+        <>
+          <p style={{ fontSize: 11, color: 'var(--muted)', margin: '12px 0 8px' }}>
+            Signed but not yet invoiced. By SOP this is month 1 — recording the first invoice is
+            what starts billing and makes the retainer active.
+          </p>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+            <input
+              type="date"
+              value={invoiceDate}
+              min={retainer.agreement_signed_on || undefined}
+              disabled={saving}
+              onChange={e => setInvoiceDate(e.target.value)}
+              style={{ padding: 8, border: '1px solid var(--line)', background: 'var(--soft)', borderRadius: 9, color: 'var(--text)', fontSize: 12 }}
+            />
+            <button className="primary" onClick={submitInvoice} disabled={saving}>
+              {saving ? 'Recording…' : 'Record first invoice'}
+            </button>
+          </div>
+        </>
+      ) : (
+        <>
+          <Info label="First invoice" value={fmtDate(retainer.first_invoice_issued_on)} />
+          <Info label="Billing anchor" value={fmtDate(retainer.billing_anchor)} />
+          <Info label="Next invoice due" value={fmtDate(retainer.next_invoice_due)} />
+        </>
+      )}
+    </>
+  )
+}
+
+function ProjectPanel({ c, retainer, onConvertRetainer, onRecordFirstInvoice, onStageChange, onTierChange, onAddMilestone, onToggleMilestone, onApplyTemplate, onUpdateProgress, onDeleteMilestone }: { c: any; retainer: any; onConvertRetainer: (c: any) => void; onRecordFirstInvoice: (r: any, d: string) => void; onStageChange: (id: string, stage: string) => void; onTierChange: (id: string, tier: string) => void; onAddMilestone: (c: any, m: any) => void; onToggleMilestone: (companyId: string, milestoneId: string, status: string) => void; onApplyTemplate: (c: any, tier: string) => void; onUpdateProgress: (companyId: string, milestoneId: string, progress: number) => void; onDeleteMilestone: (companyId: string, milestoneId: string) => void }) {
   const [title, setTitle] = useState('')
   const [cadence, setCadence] = useState('once')
   const [category, setCategory] = useState('goal')
@@ -1100,7 +1274,18 @@ function ProjectPanel({ c, onStageChange, onTierChange, onAddMilestone, onToggle
               </select>
             </label>
           </div>
-          <div className="panel-head" style={{ marginTop: 22 }}><h2>Retainer tier</h2></div>
+          <div className="panel-head" style={{ marginTop: 22 }}><h2>Retainer</h2></div>
+          <RetainerBlock
+            c={c}
+            retainer={retainer}
+            onConvert={onConvertRetainer}
+            onRecordFirstInvoice={onRecordFirstInvoice}
+          />
+
+          {/* Legacy companies.retainer_tier control, left in place deliberately — this column is
+              being retired under the drop-unused workstream and was explicitly out of scope here.
+              It drives the standard-goals template below and nothing else. */}
+          <div className="panel-head" style={{ marginTop: 22 }}><h2>Retainer goal template</h2></div>
           <div className="form-grid" style={{ gridTemplateColumns: '1fr', padding: 0 }}>
             <label>Tier
               <select value={c.retainer_tier || ''} onChange={e => onTierChange(c.id, e.target.value)}>
@@ -1109,7 +1294,7 @@ function ProjectPanel({ c, onStageChange, onTierChange, onAddMilestone, onToggle
               </select>
             </label>
           </div>
-          {c.retainer_tier && retainerGoalTemplates[c.retainer_tier]?.length > 0 && (
+          {c.retainer_tier && goalTemplateFor(c.retainer_tier).length > 0 && (
             <button className="text-btn" style={{ marginTop: 12 }} onClick={() => onApplyTemplate(c, c.retainer_tier)}>
               <Plus /> Add {c.retainer_tier}'s standard goals
             </button>
@@ -1542,6 +1727,75 @@ function CompanyForm({ stages, initial, onClose, onSave }: { stages: string[]; i
           <label>Founder phone<input value={f.contact.phone} onChange={e => upd('contact', { ...f.contact, phone: e.target.value })} /></label>
         </div>
         <div className="modal-foot"><button className="ghost" onClick={onClose}>Cancel</button><button className="primary" disabled={!f.name} onClick={() => onSave(f)}>{initial ? 'Save changes' : 'Create company'}</button></div>
+      </div>
+    </div>
+  )
+}
+
+function ConvertToRetainerForm({ company, onClose, onSave }: { company: any; onClose: () => void; onSave: (f: any) => void }) {
+  const [tier, setTier] = useState(retainerTierNames[0])
+  const [amount, setAmount] = useState(String(retainerTierDefaults[retainerTierNames[0]]))
+  // Once the amount has been typed over, changing tier stops overwriting it — the agreed number
+  // is the one that matters and it is not always the list price.
+  const [amountTouched, setAmountTouched] = useState(false)
+  const [signed, setSigned] = useState('')
+  const [invoiced, setInvoiced] = useState('')
+  const [saving, setSaving] = useState(false)
+
+  async function submit() {
+    if (!signed) { alert('The agreement date is required — it is what creates the retainer.'); return }
+    const n = Number(amount)
+    if (!Number.isFinite(n) || n < 0) { alert('Enter a valid monthly amount.'); return }
+    if (invoiced && invoiced < signed) { alert('The first invoice cannot predate the agreement.'); return }
+    setSaving(true)
+    await onSave({ tier, monthly_amount: n, agreement_signed_on: signed, first_invoice_issued_on: invoiced || null })
+    setSaving(false)
+  }
+
+  return (
+    <div className="modal-back">
+      <div className="modal" style={{ width: 'min(560px,96vw)' }}>
+        <div className="modal-head">
+          <div><div className="eyebrow">CONVERT TO RETAINER</div><h2>{company.name}</h2></div>
+          <button onClick={onClose} disabled={saving}><X /></button>
+        </div>
+        <div className="form-grid" style={{ gridTemplateColumns: '1fr 1fr' }}>
+          <label>Tier
+            <select
+              value={tier}
+              disabled={saving}
+              onChange={e => {
+                setTier(e.target.value)
+                if (!amountTouched) setAmount(String(retainerTierDefaults[e.target.value]))
+              }}
+            >
+              {retainerTierNames.map(t => <option key={t} value={t}>{t}</option>)}
+            </select>
+          </label>
+          <label>Monthly amount (₹)
+            <input
+              type="number" min={0} value={amount} disabled={saving}
+              onChange={e => { setAmount(e.target.value); setAmountTouched(true) }}
+            />
+          </label>
+          <label style={{ gridColumn: '1 / -1' }}>Agreement signed on *
+            <input type="date" value={signed} disabled={saving} onChange={e => setSigned(e.target.value)} />
+          </label>
+          <label style={{ gridColumn: '1 / -1' }}>First invoice issued on
+            <input type="date" value={invoiced} min={signed || undefined} disabled={saving} onChange={e => setInvoiced(e.target.value)} />
+          </label>
+        </div>
+        <p style={{ fontSize: 11, color: 'var(--muted)', padding: '0 22px', margin: '0 0 8px', lineHeight: 1.6 }}>
+          Leave the invoice date blank if it has not been raised yet — that is the normal case, and
+          the retainer is created <b>pending</b> until you record it. Filling it in now creates the
+          retainer already <b>active</b>, with billing anchored to that date.
+        </p>
+        <div className="modal-foot">
+          <button className="ghost" onClick={onClose} disabled={saving}>Cancel</button>
+          <button className="primary" onClick={submit} disabled={saving || !signed}>
+            {saving ? 'Creating…' : 'Create retainer'}
+          </button>
+        </div>
       </div>
     </div>
   )
