@@ -5,6 +5,10 @@ create table if not exists profiles (
  username text unique,
  display_name text,
  role text not null default 'member' check (role in ('admin','member')),
+ -- Gate for RLS: having an auth account is not the same as being VESPER staff. Self-signup
+ -- means anyone can get an account, so every data policy below checks this instead of merely
+ -- checking `to authenticated`. New signups land here as false and can read nothing.
+ approved boolean not null default false,
  created_at timestamptz not null default now()
 );
 
@@ -153,8 +157,18 @@ create table if not exists milestones (
  created_at timestamptz not null default now(),
  updated_at timestamptz not null default now()
 );
+-- Reads the approval gate WITHOUT recursing: a policy on `profiles` that selects from
+-- `profiles` fails with 42P17 (infinite recursion). SECURITY DEFINER runs this one lookup as
+-- the function owner, which skips RLS for it and breaks the cycle.
+create or replace function public.is_approved() returns boolean
+  language sql stable security definer set search_path = public as $$
+  select exists (select 1 from profiles where id = auth.uid() and approved)
+$$;
+revoke all on function public.is_approved() from public;
+grant execute on function public.is_approved() to authenticated;
+
 alter table milestones enable row level security;
-create policy "authenticated milestones" on milestones for all to authenticated using (true) with check (true);
+create policy "approved milestones" on milestones for all to authenticated using (public.is_approved()) with check (public.is_approved());
 create or replace trigger milestones_updated before update on milestones for each row execute function set_updated_at();
 
 alter table profiles enable row level security;
@@ -167,18 +181,20 @@ alter table meetings enable row level security;
 alter table calendar_connections enable row level security;
 alter table audit_log enable row level security;
 
-create policy "authenticated profiles" on profiles for select to authenticated using (true);
-create policy "authenticated companies" on companies for all to authenticated using (true) with check (true);
-create policy "authenticated contacts" on contacts for all to authenticated using (true) with check (true);
-create policy "authenticated opportunities" on opportunities for all to authenticated using (true) with check (true);
-create policy "authenticated activities" on activities for all to authenticated using (true) with check (true);
-create policy "authenticated tasks" on tasks for all to authenticated using (true) with check (true);
-create policy "authenticated meetings" on meetings for all to authenticated using (true) with check (true);
+create policy "own or approved profiles" on profiles for select to authenticated using (id = auth.uid() or public.is_approved());
+create policy "approved companies" on companies for all to authenticated using (public.is_approved()) with check (public.is_approved());
+create policy "approved contacts" on contacts for all to authenticated using (public.is_approved()) with check (public.is_approved());
+create policy "approved opportunities" on opportunities for all to authenticated using (public.is_approved()) with check (public.is_approved());
+create policy "approved activities" on activities for all to authenticated using (public.is_approved()) with check (public.is_approved());
+create policy "approved tasks" on tasks for all to authenticated using (public.is_approved()) with check (public.is_approved());
+create policy "approved meetings" on meetings for all to authenticated using (public.is_approved()) with check (public.is_approved());
 create policy "own calendar connection" on calendar_connections for all to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid());
-create policy "authenticated audit" on audit_log for all to authenticated using (true) with check (true);
+create policy "approved audit" on audit_log for all to authenticated using (public.is_approved()) with check (public.is_approved());
 
-insert into profiles (id, username, display_name, role)
-select id, coalesce(raw_user_meta_data->>'username', split_part(email,'@',1)), coalesce(raw_user_meta_data->>'display_name', split_part(email,'@',1)), 'admin'
+-- Accounts that already existed when this ran are the founding staff: admin + approved.
+-- Everyone who signs up after this gets 'member'/approved=false via handle_new_user().
+insert into profiles (id, username, display_name, role, approved)
+select id, coalesce(raw_user_meta_data->>'username', split_part(email,'@',1)), coalesce(raw_user_meta_data->>'display_name', split_part(email,'@',1)), 'admin', true
 from auth.users
 on conflict (id) do nothing;
 
@@ -220,7 +236,8 @@ create table if not exists pipeline_stages (
 );
 alter table pipeline_stages enable row level security;
 drop policy if exists "authenticated pipeline_stages" on pipeline_stages;
-create policy "authenticated pipeline_stages" on pipeline_stages for all to authenticated using (true) with check (true);
+drop policy if exists "approved pipeline_stages" on pipeline_stages;
+create policy "approved pipeline_stages" on pipeline_stages for all to authenticated using (public.is_approved()) with check (public.is_approved());
 insert into pipeline_stages (name, kind, position) values
  ('Prospect','open',1),('Qualified Lead','open',2),('Discovery Call','open',3),
  ('Proposal Agreement Sent','open',4),('Close Call','open',5),('Verbal Approval','open',6),
