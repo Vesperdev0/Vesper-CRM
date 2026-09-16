@@ -587,7 +587,7 @@ export default function Page() {
     const ev = json.event
     const { data: row, error } = await supabase.from('meetings').insert({
       company_id: company.id, created_by: auth.user?.id, title: m.title, meeting_type: m.meeting_type, starts_at: m.starts_at, ends_at: m.ends_at,
-      location: m.location || null, google_event_id: ev?.id || null, google_calendar_id: 'primary',
+      location: m.location || null, google_event_id: ev?.id || null, google_calendar_id: json.calendarId || 'primary',
       google_meet_url: ev?.hangoutLink || null, status: 'scheduled',
     }).select('*,companies(name)').single()
     if (error) { alert(error.message); return }
