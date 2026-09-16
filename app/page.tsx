@@ -401,10 +401,20 @@ export default function Page() {
   }
   // Optimistic single-field (or multi-field) milestone edit — the table view edits everything
   // (title, status, priority, dates, cadence, category) through this one path.
+  // Rolls back on failure: this used to paint the new value, alert, and then leave the value
+  // that never saved sitting on screen until a reload, so a rejected edit looked like it worked.
   async function updateMilestoneFields(companyId: string, milestoneId: string, patch: any) {
+    const before = (companies.find(c => c.id === companyId)?.milestones || []).find((m: any) => m.id === milestoneId)
     patchMilestonesLocally(companyId, ms => ms.map(m => (m.id === milestoneId ? { ...m, ...patch } : m)))
     const { error } = await supabase.from('milestones').update(patch).eq('id', milestoneId)
-    if (error) alert(error.message)
+    if (error) {
+      // Restore only the fields this call touched, so a concurrent edit to another field survives.
+      if (before) {
+        const revert = Object.fromEntries(Object.keys(patch).map(k => [k, before[k]]))
+        patchMilestonesLocally(companyId, ms => ms.map(m => (m.id === milestoneId ? { ...m, ...revert } : m)))
+      }
+      alert(error.message)
+    }
   }
   async function updateMilestoneProgress(companyId: string, milestoneId: string, progress: number) {
     await updateMilestoneFields(companyId, milestoneId, { progress })
