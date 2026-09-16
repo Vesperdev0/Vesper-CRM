@@ -191,6 +191,17 @@ export default function Page() {
     await loadMeetings()
   }
 
+  // Calendar sync imports Google events with company_id null, and until now there was no way
+  // to ever set it — the sync route's own comment said to "link it to a company by hand from
+  // the Companies view", but no such control existed anywhere, so every event created in
+  // Google rather than in VESPER was stuck rendering as "—".
+  async function linkMeetingToCompany(meetingId: string, companyId: string) {
+    const { data, error } = await supabase.from('meetings')
+      .update({ company_id: companyId || null }).eq('id', meetingId).select('*,companies(name)').single()
+    if (error) { alert(error.message); return }
+    setMeetings(x => x.map(m => (m.id === meetingId ? data : m)))
+  }
+
   async function deleteMeeting(m: any) {
     if (!confirm(`Delete "${m.title}"? This cannot be undone.`)) return
     // Cancel the Google Calendar event first (same reasoning as deleteCompany: if we only
@@ -587,11 +598,11 @@ export default function Page() {
           </div>
         </header>
         <div className="content">
-          {view === 'home' && <HomeView companies={companies} meetings={meetings} closedStages={closedStageNames} onOpen={(c: any) => { setSelected(c); setView('detail') }} onNew={() => setShowNew(true)} onGoCalendar={() => setView('calendar')} onDeleteMeeting={deleteMeeting} />}
+          {view === 'home' && <HomeView companies={companies} meetings={meetings} closedStages={closedStageNames} onOpen={(c: any) => { setSelected(c); setView('detail') }} onNew={() => setShowNew(true)} onGoCalendar={() => setView('calendar')} onDeleteMeeting={deleteMeeting} onLinkMeeting={linkMeetingToCompany} />}
           {view === 'pipeline' && <Pipeline companies={filtered.filter((c: any) => !c.project_stage)} stages={stageRows} onOpen={(c: any) => { setSelected(c); setView('detail') }} onUpdate={handleStageChange} onOutreachChange={updateOutreachStatus} onRenameStage={renameStage} onAddStage={addStage} />}
           {view === 'companies' && <Companies companies={aiMatches ?? filtered} onOpen={(c: any) => { setSelected(c); setView('detail') }} onNew={() => setShowNew(true)} onOutreachChange={updateOutreachStatus} />}
           {view === 'projects' && <ProjectsView companies={companies} onToggleMilestone={toggleMilestone} onUpdateProgress={updateMilestoneProgress} onUpdateFields={updateMilestoneFields} onDeleteMilestone={deleteMilestone} onProjectStageChange={updateProjectStage} onOpenCompany={(c: any) => { setSelected(c); setView('detail') }} />}
-          {view === 'calendar' && <CalendarView meetings={meetings} googleConn={googleConn} onSync={syncGoogleCalendar} onDeleteMeeting={deleteMeeting} />}
+          {view === 'calendar' && <CalendarView meetings={meetings} companies={companies} googleConn={googleConn} onSync={syncGoogleCalendar} onDeleteMeeting={deleteMeeting} onLinkMeeting={linkMeetingToCompany} />}
           {view === 'tasks' && <Tasks tasks={tasks} companies={companies} onToggle={toggleTask} onAdd={addTask} onDelete={deleteTask} />}
           {view === 'settings' && <SettingsView googleConn={googleConn} profile={profile} user={user} />}
           {view === 'detail' && selected && (
@@ -640,7 +651,7 @@ function Nav({ active, icon, label, onClick }: { active: boolean; icon: any; lab
   return <button className={active ? 'nav active' : 'nav'} onClick={onClick}>{icon}<span>{label}</span></button>
 }
 
-function HomeView({ companies, meetings, closedStages, onOpen, onNew, onGoCalendar, onDeleteMeeting }: { companies: any[]; meetings: any[]; closedStages: string[]; onOpen: any; onNew: any; onGoCalendar: any; onDeleteMeeting: any }) {
+function HomeView({ companies, meetings, closedStages, onOpen, onNew, onGoCalendar, onDeleteMeeting, onLinkMeeting }: { companies: any[]; meetings: any[]; closedStages: string[]; onOpen: any; onNew: any; onGoCalendar: any; onDeleteMeeting: any; onLinkMeeting: any }) {
   const upcoming = meetings.filter(m => new Date(m.starts_at) >= new Date(Date.now() - 3600000)).sort((a, b) => a.starts_at.localeCompare(b.starts_at))
   const qualified = companies.filter(c => c.lead_status === 'Qualified Lead').length
 
@@ -674,7 +685,11 @@ function HomeView({ companies, meetings, closedStages, onOpen, onNew, onGoCalend
           {upcoming.length ? upcoming.slice(0, 4).map((m: any) => (
             <div className="meeting" key={m.id}>
               <div className="time"><b>{new Date(m.starts_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</b><span>{new Date(m.starts_at).toLocaleDateString([], { month: 'short', day: 'numeric' })}</span></div>
-              <div><b>{m.companies?.name || '—'}</b><p>{m.meeting_type || 'Meeting'}{m.google_meet_url ? ' · Google Meet' : ''}</p></div>
+              <div>
+                <b>{m.companies?.name || m.title}</b>
+                <p>{m.meeting_type || 'Meeting'}{m.google_meet_url ? ' · Google Meet' : ''}</p>
+                {!m.company_id && <MeetingCompanyPicker meeting={m} companies={companies} onLink={onLinkMeeting} />}
+              </div>
               <button className="icon-btn" onClick={() => onDeleteMeeting(m)} title="Delete meeting"><Trash2 /></button>
             </div>
           )) : <Empty title="No meetings yet" text="Meetings you schedule from a company page will appear here." />}
@@ -708,6 +723,23 @@ function HomeView({ companies, meetings, closedStages, onOpen, onNew, onGoCalend
     </>
   )
 }
+// Shown on any meeting that isn't attached to a company yet — i.e. everything Google sync
+// pulled in. Stops click-through so using it inside a clickable card doesn't navigate away.
+function MeetingCompanyPicker({ meeting, companies, onLink, compact }: { meeting: any; companies: any[]; onLink: any; compact?: boolean }) {
+  return (
+    <select
+      className="outreach-select"
+      style={compact ? { margin: '6px 0 0', fontSize: 9 } : { margin: '6px 0 0', width: 'auto' }}
+      value={meeting.company_id || ''}
+      onClick={e => e.stopPropagation()}
+      onChange={e => { e.stopPropagation(); onLink(meeting.id, e.target.value) }}
+    >
+      <option value="">— link to company —</option>
+      {companies.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+    </select>
+  )
+}
+
 function Metric({ label, value }: { label: string; value: any }) { return <div className="metric"><span>{label}</span><strong>{value}</strong></div> }
 function Attention({ icon, title, text, onClick }: { icon: any; title: string; text: string; onClick?: () => void }) {
   return <div className="attention" onClick={onClick} style={onClick ? { cursor: 'pointer' } : undefined}>{icon}<div><b>{title}</b><p>{text}</p></div></div>
@@ -991,7 +1023,7 @@ function ProjectPanel({ c, onStageChange, onTierChange, onAddMilestone, onToggle
   )
 }
 
-function CalendarView({ meetings, googleConn, onSync, onDeleteMeeting }: { meetings: any[]; googleConn: any; onSync: (manual?: boolean) => void | Promise<void>; onDeleteMeeting: any }) {
+function CalendarView({ meetings, companies, googleConn, onSync, onDeleteMeeting, onLinkMeeting }: { meetings: any[]; companies: any[]; googleConn: any; onSync: (manual?: boolean) => void | Promise<void>; onDeleteMeeting: any; onLinkMeeting: any }) {
   const [weekStart, setWeekStart] = useState<Date>(() => startOfWeek(new Date(), { weekStartsOn: 1 }))
   const [syncing, setSyncing] = useState(false)
   const days = [0, 1, 2, 3, 4, 5, 6].map(i => addDays(weekStart, i))
@@ -1045,6 +1077,7 @@ function CalendarView({ meetings, googleConn, onSync, onDeleteMeeting }: { meeti
                   <div className="cal-event" key={m.id}>
                     <button className="cal-event-delete" onClick={() => onDeleteMeeting(m)} title="Delete meeting"><X /></button>
                     <strong>{m.companies?.name || m.title}</strong><small>{m.title}{m.google_meet_url ? ' · Meet' : ''}</small>
+                    {!m.company_id && <MeetingCompanyPicker meeting={m} companies={companies} onLink={onLinkMeeting} compact />}
                   </div>
                 ))}
               </div>
