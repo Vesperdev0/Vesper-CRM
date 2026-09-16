@@ -429,11 +429,17 @@ export default function Page() {
     if (error) { alert(error.message); return }
     patchMilestonesLocally(companyId, ms => ms.map(m => (m.id === milestoneId ? { ...m, status } : m)))
   }
+  // Skips goals this company already has. The button is permanently visible on the Project tab
+  // and inserted blindly before, so a second click silently produced a duplicate of every
+  // standard goal — and nothing in the UI hinted that it already ran once.
   async function applyRetainerTemplate(company: any, tier: string) {
     const template = retainerGoalTemplates[tier] || []
     if (!template.length) return
+    const existing = new Set((company.milestones || []).map((m: any) => m.title))
+    const missing = template.filter(t => !existing.has(t.title))
+    if (!missing.length) { alert(`Every standard ${tier} goal is already on this company.`); return }
     const { data, error } = await supabase.from('milestones').insert(
-      template.map(t => ({ company_id: company.id, title: t.title, cadence: t.cadence, category: 'goal' }))
+      missing.map(t => ({ company_id: company.id, title: t.title, cadence: t.cadence, category: 'goal' }))
     ).select()
     if (error) { alert(error.message); return }
     patchMilestonesLocally(company.id, ms => [...ms, ...(data || [])])
