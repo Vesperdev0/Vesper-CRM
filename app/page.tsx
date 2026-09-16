@@ -81,18 +81,39 @@ function fmtDate(d: string | null | undefined) {
 // The "ask VESPER" matcher — plain keyword rules, no external AI service. Pure function so the
 // result can be derived fresh whenever companies change (the old version ran once via a stale
 // setTimeout closure and answered the PREVIOUS question). Rules narrow cumulatively.
-function runAIQuery(query: string, companies: any[]) {
-  const s = query.toLowerCase()
+//
+// Returns null when nothing matched, which is the point of this rewrite: the old version always
+// returned an array, so an unparsed question produced a confident "VESPER found 0" that was
+// indistinguishable from a real empty result. Two rules were also actively wrong — the place
+// filter took the LAST word of the sentence regardless of where "in" was ("deals in progress"
+// searched addresses for "progress"), and the `state` test also fired on the word "status".
+function runAIQuery(query: string, companies: any[]): any[] | null {
+  const s = query.toLowerCase().trim()
   let r = companies
-  if (s.includes('state') || s.includes('city') || s.includes('in ')) {
-    const words = s.split(/\s+/)
-    const candidate = words[words.length - 1].replace(/[?.]/g, '')
-    r = r.filter(c => (c.address || '').toLowerCase().includes(candidate))
+  let matched = false
+
+  // Words that commonly follow "in" without naming a place — without these, "deals in progress"
+  // searches addresses for "progress" and reports a confident zero.
+  const notPlaces = new Set(['progress', 'play', 'person', 'total', 'general', 'detail', 'review', 'order', 'touch', 'future', 'the pipeline', 'pipeline'])
+
+  // Take what follows "in", not the end of the sentence.
+  const place = s.match(/\bin\s+([a-z][a-z\s]*?)\s*[?.!]*$/)
+  if (place) {
+    const p = place[1].trim()
+    if (p.length > 2 && !notPlaces.has(p)) { r = r.filter(c => (c.address || '').toLowerCase().includes(p)); matched = true }
   }
-  if (s.includes('qualified')) r = r.filter(c => c.lead_status === 'Qualified Lead')
-  if (s.includes('website') && s.includes('no')) r = r.filter(c => c.site_condition === 'No Site')
-  if (s.includes('meeting')) r = r.filter(c => c.activities?.some((a: any) => a.type === 'meeting'))
-  return r
+  if (/\bqualified\b/.test(s)) { r = r.filter(c => c.lead_status === 'Qualified Lead'); matched = true }
+  if (/\bno\s+(website|site)\b/.test(s)) { r = r.filter(c => c.site_condition === 'No Site'); matched = true }
+  if (/\bmeetings?\b/.test(s)) { r = r.filter(c => c.activities?.some((a: any) => a.type === 'meeting')); matched = true }
+  if (/\b(gbp|google business)\b/.test(s)) { r = r.filter(c => c.gbp); matched = true }
+  if (/\bstalled?\b/.test(s)) {
+    r = r.filter(c => {
+      const last = (c.activities || []).reduce((max: string | null, a: any) => (!max || a.occurred_at > max) ? a.occurred_at : max, null) || c.updated_at
+      return !last || Date.now() - new Date(last).getTime() >= 14 * 86400000
+    })
+    matched = true
+  }
+  return matched ? r : null
 }
 // A milestone counts as overdue when it isn't done and its target date has passed (or the DB
 // says 'missed' — a status the schema always had but the boards used to silently bucket into
@@ -269,8 +290,12 @@ export default function Page() {
   }, [companies, q])
 
   // Non-null while an "ask VESPER" query is active; recomputed from live data so the filtered
-  // list stays correct after edits instead of showing a snapshot.
-  const aiMatches = useMemo(() => (aiQuery == null ? null : runAIQuery(aiQuery, companies)), [aiQuery, companies])
+  // list stays correct after edits instead of showing a snapshot. `.matches` is null when no
+  // rule understood the question — distinct from a rule matching zero companies.
+  const aiResult = useMemo(
+    () => (aiQuery == null ? null : { q: aiQuery, matches: runAIQuery(aiQuery, companies) }),
+    [aiQuery, companies]
+  )
 
   async function login(e: React.FormEvent) {
     e.preventDefault()
@@ -616,7 +641,7 @@ export default function Page() {
         <div className="content">
           {view === 'home' && <HomeView companies={companies} meetings={meetings} closedStages={closedStageNames} onOpen={(c: any) => { setSelected(c); setView('detail') }} onNew={() => setShowNew(true)} onGoCalendar={() => setView('calendar')} onDeleteMeeting={deleteMeeting} onLinkMeeting={linkMeetingToCompany} />}
           {view === 'pipeline' && <Pipeline companies={filtered.filter((c: any) => !c.project_stage)} stages={stageRows} onOpen={(c: any) => { setSelected(c); setView('detail') }} onUpdate={handleStageChange} onOutreachChange={updateOutreachStatus} onRenameStage={renameStage} onAddStage={addStage} />}
-          {view === 'companies' && <Companies companies={aiMatches ?? filtered} onOpen={(c: any) => { setSelected(c); setView('detail') }} onNew={() => setShowNew(true)} onOutreachChange={updateOutreachStatus} />}
+          {view === 'companies' && <Companies companies={aiResult?.matches ?? filtered} onOpen={(c: any) => { setSelected(c); setView('detail') }} onNew={() => setShowNew(true)} onOutreachChange={updateOutreachStatus} />}
           {view === 'projects' && <ProjectsView companies={filtered} onToggleMilestone={toggleMilestone} onUpdateProgress={updateMilestoneProgress} onUpdateFields={updateMilestoneFields} onDeleteMilestone={deleteMilestone} onProjectStageChange={updateProjectStage} onOpenCompany={(c: any) => { setSelected(c); setView('detail') }} />}
           {view === 'calendar' && <CalendarView meetings={meetings} companies={companies} googleConn={googleConn} onSync={syncGoogleCalendar} onDeleteMeeting={deleteMeeting} onLinkMeeting={linkMeetingToCompany} />}
           {view === 'tasks' && <Tasks tasks={tasks} companies={companies} onToggle={toggleTask} onAdd={addTask} onDelete={deleteTask} />}
@@ -653,12 +678,19 @@ export default function Page() {
         <Nav active={view === 'calendar'} icon={<Calendar />} label="Calendar" onClick={() => setView('calendar')} />
         <Nav active={view === 'tasks'} icon={<CheckCircle2 />} label="Tasks" onClick={() => setView('tasks')} />
       </nav>
-      <button className="ai-fab" onClick={() => { const v = prompt('Ask VESPER anything about your CRM'); if (v) { setAiQuery(v); setView('companies') } }}><Command /></button>
+      <button className="ai-fab" onClick={() => { const v = prompt('Filter companies — try "qualified leads in mumbai", "companies with no website", "stalled", "has GBP"'); if (v) { setAiQuery(v); setView('companies') } }}><Command /></button>
       {showNew && <CompanyForm stages={stageNames} onClose={() => setShowNew(false)} onSave={addCompany} />}
       {editCompany && <CompanyForm stages={stageNames} initial={editCompany} onClose={() => setEditCompany(null)} onSave={(f: any) => saveEditedCompany(editCompany.id, f)} />}
       {showActivity && <AddActivity company={showActivity} onClose={() => setShowActivity(null)} onSave={(a: any) => addActivity(showActivity, a)} />}
       {showMeeting && <NewMeetingForm company={showMeeting} onClose={() => setShowMeeting(null)} onSave={(m: any) => scheduleMeeting(showMeeting, m)} />}
-      {aiMatches != null && <div className="toast"><b>VESPER found {aiMatches.length}</b><button onClick={() => setAiQuery(null)}><X /></button></div>}
+      {aiResult && (
+        <div className="toast">
+          {aiResult.matches
+            ? <b>VESPER found {aiResult.matches.length}</b>
+            : <b>Couldn’t read “{aiResult.q}” — showing everything</b>}
+          <button onClick={() => setAiQuery(null)}><X /></button>
+        </div>
+      )}
     </div>
   )
 }
