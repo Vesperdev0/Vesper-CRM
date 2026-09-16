@@ -62,6 +62,14 @@ drop policy if exists "authenticated pipeline_stages" on pipeline_stages;
 create policy "approved pipeline_stages" on pipeline_stages for all to authenticated
   using (public.is_approved()) with check (public.is_approved());
 
+drop policy if exists "authenticated audit" on audit_log;
+drop policy if exists "approved audit" on audit_log;
+-- Append-only on purpose. An audit trail that the audited party can edit or delete is not an
+-- audit trail — the old `for all using (true)` let any user erase their own history. No update
+-- or delete policy exists, so those are denied outright; corrections go in as new rows.
+create policy "approved audit read" on audit_log for select to authenticated using (public.is_approved());
+create policy "approved audit append" on audit_log for insert to authenticated with check (public.is_approved());
+
 -- 4) profiles: you can always see your own row (the app reads your role from it, and an
 --    unapproved user needs to be able to load the page far enough to be told they're pending).
 --    Everyone else's row requires the gate.

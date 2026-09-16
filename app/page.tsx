@@ -110,6 +110,7 @@ export default function Page() {
   const [tasks, setTasks] = useState<any[]>([])
   const [meetings, setMeetings] = useState<any[]>([])
   const [googleConn, setGoogleConn] = useState<any>(null)
+  const [profile, setProfile] = useState<any>(null)
   const [view, setView] = useState('home')
   const [selected, setSelected] = useState<any>(null)
   const [dark, setDark] = useState(false)
@@ -146,6 +147,17 @@ export default function Page() {
     setMeetings(mt || [])
   }
 
+  // Settings used to state flatly that "Roles are stored in your VESPER profiles" while
+  // nothing in the app had ever read profiles. Read the real row so the claim is true, and so
+  // an account that hasn't been approved yet can be told that instead of seeing empty boards.
+  async function loadProfile() {
+    const { data: auth } = await supabase.auth.getUser()
+    if (!auth.user) { setProfile(null); return }
+    const { data } = await supabase.from('profiles')
+      .select('id,username,display_name,role,approved').eq('id', auth.user.id).maybeSingle()
+    setProfile(data || null)
+  }
+
   async function loadGoogleConn() {
     const { data: auth } = await supabase.auth.getUser()
     if (!auth.user) { setGoogleConn(null); return }
@@ -166,7 +178,7 @@ export default function Page() {
     ])
     setCompanies((comp || []).map((x: any) => ({ ...x, contact: x.contacts?.[0] || null })))
     setTasks(tk || [])
-    await Promise.all([loadMeetings(), loadGoogleConn(), loadStages()])
+    await Promise.all([loadMeetings(), loadGoogleConn(), loadStages(), loadProfile()])
   }
 
   async function syncGoogleCalendar(manual = false) {
@@ -260,7 +272,7 @@ export default function Page() {
   }
   async function logout() {
     await supabase.auth.signOut()
-    setUser(null); setCompanies([]); setTasks([]); setMeetings([]); setSelected(null); setAiQuery(null); setView('home')
+    setUser(null); setCompanies([]); setTasks([]); setMeetings([]); setProfile(null); setSelected(null); setAiQuery(null); setView('home')
   }
 
   async function addCompany(c: any) {
@@ -581,7 +593,7 @@ export default function Page() {
           {view === 'projects' && <ProjectsView companies={companies} onToggleMilestone={toggleMilestone} onUpdateProgress={updateMilestoneProgress} onUpdateFields={updateMilestoneFields} onDeleteMilestone={deleteMilestone} onProjectStageChange={updateProjectStage} onOpenCompany={(c: any) => { setSelected(c); setView('detail') }} />}
           {view === 'calendar' && <CalendarView meetings={meetings} googleConn={googleConn} onSync={syncGoogleCalendar} onDeleteMeeting={deleteMeeting} />}
           {view === 'tasks' && <Tasks tasks={tasks} companies={companies} onToggle={toggleTask} onAdd={addTask} onDelete={deleteTask} />}
-          {view === 'settings' && <SettingsView googleConn={googleConn} />}
+          {view === 'settings' && <SettingsView googleConn={googleConn} profile={profile} user={user} />}
           {view === 'detail' && selected && (
             <Detail
               c={selected}
@@ -1279,7 +1291,7 @@ function ProjectsView({ companies, onToggleMilestone, onUpdateProgress, onUpdate
   )
 }
 
-function SettingsView({ googleConn }: { googleConn: any }) {
+function SettingsView({ googleConn, profile, user }: { googleConn: any; profile: any; user: any }) {
   return (
     <>
       <div className="page-title"><div><div className="eyebrow">SETTINGS</div><h1>VESPER.</h1><p>Workspace settings and integrations.</p></div></div>
@@ -1291,7 +1303,18 @@ function SettingsView({ googleConn }: { googleConn: any }) {
             ? <span className="status active">Connected · {googleConn.connected_email || 'Google'}</span>
             : <a className="primary link" href="/api/calendar/auth">Connect Google Calendar</a>}
         </div>
-        <div className="panel"><h2>Workspace</h2><p>Two-user outreach workspace. Roles are stored in your VESPER profiles.</p><span className="status active">Active</span></div>
+        <div className="panel">
+          <h2>Workspace</h2>
+          <p>Shared two-person outreach workspace. Everyone approved sees every company.</p>
+          <Info label="Signed in as" value={profile?.display_name || profile?.username || user?.email} />
+          <Info label="Role" value={profile ? profile.role : '—'} />
+          <Info label="Access" value={profile ? (profile.approved ? 'Approved' : 'Pending approval') : '—'} />
+          <p style={{ marginTop: 12, fontSize: 11 }}>
+            Roles are recorded but not yet enforced — admin and member currently have identical
+            permissions. Access is what the database actually checks: an unapproved account can
+            sign in but reads nothing. Approve one from the Supabase table editor.
+          </p>
+        </div>
       </div>
     </>
   )

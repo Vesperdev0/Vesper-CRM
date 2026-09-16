@@ -207,8 +207,13 @@ drop policy if exists "approved meetings" on meetings;
 create policy "approved meetings" on meetings for all to authenticated using (public.is_approved()) with check (public.is_approved());
 drop policy if exists "own calendar connection" on calendar_connections;
 create policy "own calendar connection" on calendar_connections for all to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid());
+drop policy if exists "authenticated audit" on audit_log;
 drop policy if exists "approved audit" on audit_log;
-create policy "approved audit" on audit_log for all to authenticated using (public.is_approved()) with check (public.is_approved());
+-- Append-only on purpose. An audit trail that the audited party can edit or delete is not an
+-- audit trail — the old `for all using (true)` let any user erase their own history. No update
+-- or delete policy exists, so those are denied outright; corrections go in as new rows.
+create policy "approved audit read" on audit_log for select to authenticated using (public.is_approved());
+create policy "approved audit append" on audit_log for insert to authenticated with check (public.is_approved());
 
 -- Accounts that already existed when this ran are the founding staff: admin + approved.
 -- Everyone who signs up after this gets 'member'/approved=false via handle_new_user().
