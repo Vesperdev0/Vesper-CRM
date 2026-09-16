@@ -23,6 +23,10 @@ const defaultStageRows: any[] = [
 const outreachStatuses = ['Not Contacted', 'DM Reply', 'DM No Reply', 'Call Successful', 'Call Failed']
 const siteOptions = ['No Site','Not Working','Outdated','Not Good','Coming Soon / Under Construction','Decent','Good']
 const clientTypes = ['old','not active','active','very active']
+// meetings.meeting_type had a DB default of 'Discovery Call' and no UI, so every meeting ever
+// created reported itself as a discovery call on the Today view regardless of what it was.
+const meetingTypes = ['Discovery Call', 'Close Call', 'Onboarding Call', 'Project Review', 'Retainer Review', 'Check-in', 'Other']
+
 const activityTypes = [
   { value: 'call', label: 'Call' },
   { value: 'email', label: 'Email' },
@@ -561,7 +565,7 @@ export default function Page() {
     setTasks(x => x.filter(t => t.id !== id))
   }
 
-  async function scheduleMeeting(company: any, m: { title: string; starts_at: string; ends_at: string; location?: string }) {
+  async function scheduleMeeting(company: any, m: { title: string; meeting_type: string; starts_at: string; ends_at: string; location?: string }) {
     // The Google Calendar round trip (creating the event + provisioning a Meet link) is the one
     // genuinely slow step here and can't be shortened from our side — but everything that used
     // to run strictly AFTER it in sequence didn't need to: auth.getUser() doesn't depend on the
@@ -582,7 +586,7 @@ export default function Page() {
     const auth = authRes.data
     const ev = json.event
     const { data: row, error } = await supabase.from('meetings').insert({
-      company_id: company.id, created_by: auth.user?.id, title: m.title, starts_at: m.starts_at, ends_at: m.ends_at,
+      company_id: company.id, created_by: auth.user?.id, title: m.title, meeting_type: m.meeting_type, starts_at: m.starts_at, ends_at: m.ends_at,
       location: m.location || null, google_event_id: ev?.id || null, google_calendar_id: 'primary',
       google_meet_url: ev?.hangoutLink || null, status: 'scheduled',
     }).select('*,companies(name)').single()
@@ -1490,7 +1494,9 @@ function AddActivity({ company, onClose, onSave }: { company: any; onClose: () =
 }
 
 function NewMeetingForm({ company, onClose, onSave }: { company: any; onClose: () => void; onSave: (m: any) => void }) {
+  const [type, setType] = useState('Discovery Call')
   const [title, setTitle] = useState(`Discovery Call — ${company.name}`)
+  const [titleTouched, setTitleTouched] = useState(false)
   const [date, setDate] = useState('')
   const [start, setStart] = useState('11:30')
   const [duration, setDuration] = useState(30)
@@ -1501,7 +1507,7 @@ function NewMeetingForm({ company, onClose, onSave }: { company: any; onClose: (
     const starts_at = new Date(`${date}T${start}:00`)
     const ends_at = new Date(starts_at.getTime() + duration * 60000)
     setSaving(true)
-    await onSave({ title, starts_at: starts_at.toISOString(), ends_at: ends_at.toISOString(), location })
+    await onSave({ title, meeting_type: type, starts_at: starts_at.toISOString(), ends_at: ends_at.toISOString(), location })
     setSaving(false)
   }
   return (
@@ -1509,7 +1515,20 @@ function NewMeetingForm({ company, onClose, onSave }: { company: any; onClose: (
       <div className="modal" style={{ width: 'min(500px,96vw)' }}>
         <div className="modal-head"><div><div className="eyebrow">NEW MEETING</div><h2>{company.name}</h2></div><button onClick={onClose} disabled={saving}><X /></button></div>
         <div className="form-grid" style={{ gridTemplateColumns: '1fr 1fr' }}>
-          <label style={{ gridColumn: '1 / -1' }}>Title<input value={title} onChange={e => setTitle(e.target.value)} disabled={saving} /></label>
+          <label style={{ gridColumn: '1 / -1' }}>Type
+            <select
+              value={type}
+              disabled={saving}
+              onChange={e => {
+                setType(e.target.value)
+                // Keep the title in step until the user writes their own, then leave it alone.
+                if (!titleTouched) setTitle(`${e.target.value} — ${company.name}`)
+              }}
+            >
+              {meetingTypes.map(t => <option key={t} value={t}>{t}</option>)}
+            </select>
+          </label>
+          <label style={{ gridColumn: '1 / -1' }}>Title<input value={title} onChange={e => { setTitle(e.target.value); setTitleTouched(true) }} disabled={saving} /></label>
           <label>Date<input type="date" value={date} onChange={e => setDate(e.target.value)} disabled={saving} /></label>
           <label>Start time<input type="time" value={start} onChange={e => setStart(e.target.value)} disabled={saving} /></label>
           <label>Duration (min)<input type="number" value={duration} onChange={e => setDuration(+e.target.value)} disabled={saving} /></label>
