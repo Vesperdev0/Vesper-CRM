@@ -42,6 +42,18 @@ export async function POST() {
     if (error) return NextResponse.json({ error: error.message }, { status: 500 })
   }
 
+  // Google's end.date on an all-day event is EXCLUSIVE: a one-day event on the 16th arrives as
+  // start.date 2026-09-16 / end.date 2026-09-17. Stored verbatim, every all-day event looked a
+  // full day longer than it is. Step it back to the last day the event actually covers.
+  // (Timed events use end.dateTime, which is inclusive and needs no adjustment.)
+  function allDayEnd(startDate: string, endDate?: string | null) {
+    if (!endDate) return startDate
+    const d = new Date(`${endDate}T00:00:00Z`)
+    d.setUTCDate(d.getUTCDate() - 1)
+    const stepped = d.toISOString().slice(0, 10)
+    return stepped < startDate ? startDate : stepped
+  }
+
   const rows = events
     .filter(ev => ev.id && ev.status !== 'cancelled' && (ev.start?.dateTime || ev.start?.date))
     .map(ev => ({
@@ -49,7 +61,9 @@ export async function POST() {
       google_calendar_id: conn.calendar_id || 'primary',
       title: ev.summary || '(no title)',
       starts_at: ev.start?.dateTime || ev.start?.date,
-      ends_at: ev.end?.dateTime || ev.end?.date || ev.start?.dateTime || ev.start?.date,
+      ends_at: ev.start?.dateTime
+        ? (ev.end?.dateTime || ev.start.dateTime)
+        : allDayEnd(ev.start!.date as string, ev.end?.date),
       location: ev.location || null,
       google_meet_url: ev.hangoutLink || null,
       // `status` deliberately absent: new rows get the DB default ('scheduled'), and a status
