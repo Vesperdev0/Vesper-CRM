@@ -338,11 +338,16 @@ alter table retainers add constraint retainers_churned_date_check
  check (status <> 'churned' or churned_at is not null);
 
 -- Activation is the ONE inferred transition: recording the first invoice flips pending -> active
--- and stamps started_at and billing_anchor from that same date. Pause and churn are never
--- inferred — they are deliberate user actions and this trigger does not touch them, which is why
--- it only fires on a row still sitting at 'pending'.
--- next_invoice_due is deliberately NOT set here. The spec lists exactly two fields for activation
--- to set, and deriving a billing date would be invoice automation, which is out of scope.
+-- and stamps started_at, billing_anchor and next_invoice_due from that same date. Pause and churn
+-- are never inferred — they are deliberate user actions and this trigger does not touch them,
+-- which is why it only fires on a row still sitting at 'pending'.
+--
+-- next_invoice_due is billing_anchor + 1 MONTH. It is the date the next invoice is raised, not a
+-- payment deadline — the SOP's 7-day figure is the follow-up grace period AFTER invoicing and has
+-- no bearing on this field. Conflating the two would bill every client four times too often.
+--
+-- Postgres clamps month arithmetic to the end of a short month on its own: an anchor of Jan 31
+-- yields Feb 28, not an error and not Mar 3.
 create or replace function public.retainer_activate_on_first_invoice() returns trigger
  language plpgsql as $$
 begin
@@ -350,6 +355,7 @@ begin
     new.status := 'active';
     new.started_at := coalesce(new.started_at, new.first_invoice_issued_on);
     new.billing_anchor := coalesce(new.billing_anchor, new.first_invoice_issued_on);
+    new.next_invoice_due := coalesce(new.next_invoice_due, (new.billing_anchor + interval '1 month')::date);
   end if;
   return new;
 end $$;
@@ -357,6 +363,11 @@ end $$;
 drop trigger if exists retainers_activate on retainers;
 create trigger retainers_activate before insert or update on retainers
  for each row execute function public.retainer_activate_on_first_invoice();
+
+-- Backfill for rows activated before next_invoice_due was derived. Idempotent: only touches
+-- active rows that are missing it.
+update retainers set next_invoice_due = (billing_anchor + interval '1 month')::date
+where status = 'active' and next_invoice_due is null and billing_anchor is not null;
 
 drop trigger if exists retainers_updated on retainers;
 create trigger retainers_updated before update on retainers
