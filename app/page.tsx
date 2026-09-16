@@ -138,6 +138,9 @@ export default function Page() {
   const [profile, setProfile] = useState<any>(null)
   const [view, setView] = useState('home')
   const [selected, setSelected] = useState<any>(null)
+  // Where opening this company came from, so the detail page's back button returns there
+  // instead of always dumping you on Companies regardless of where you started.
+  const [cameFrom, setCameFrom] = useState('companies')
   const [dark, setDark] = useState(false)
   const [q, setQ] = useState('')
   const [showNew, setShowNew] = useState(false)
@@ -152,6 +155,10 @@ export default function Page() {
   const stageNames = useMemo(() => stageRows.map(s => s.name), [stageRows])
   const wonStageNames = useMemo(() => stageRows.filter(s => s.kind === 'won').map(s => s.name), [stageRows])
   const closedStageNames = useMemo(() => stageRows.filter(s => s.kind !== 'open').map(s => s.name), [stageRows])
+
+  function openCompany(c: any, from: string) {
+    setSelected(c); setCameFrom(from); setView('detail')
+  }
 
   async function loadStages() {
     const { data, error } = await supabase.from('pipeline_stages').select('*').order('position')
@@ -532,7 +539,7 @@ export default function Page() {
       if (error) { alert(error.message); return }
       setCompanies(x => x.filter(z => z.id !== id))
       setMeetings(x => x.filter(m => m.company_id !== id))
-      setSelected(null); setView('companies')
+      setSelected(null); setView(cameFrom)
     } finally {
       setDeletingId(null)
     }
@@ -643,10 +650,10 @@ export default function Page() {
           </div>
         </header>
         <div className="content">
-          {view === 'home' && <HomeView companies={companies} meetings={meetings} closedStages={closedStageNames} onOpen={(c: any) => { setSelected(c); setView('detail') }} onNew={() => setShowNew(true)} onGoCalendar={() => setView('calendar')} onDeleteMeeting={deleteMeeting} onLinkMeeting={linkMeetingToCompany} />}
-          {view === 'pipeline' && <Pipeline companies={filtered.filter((c: any) => !c.project_stage)} stages={stageRows} onOpen={(c: any) => { setSelected(c); setView('detail') }} onUpdate={handleStageChange} onOutreachChange={updateOutreachStatus} onRenameStage={renameStage} onAddStage={addStage} />}
-          {view === 'companies' && <Companies companies={aiResult?.matches ?? filtered} onOpen={(c: any) => { setSelected(c); setView('detail') }} onNew={() => setShowNew(true)} onOutreachChange={updateOutreachStatus} />}
-          {view === 'projects' && <ProjectsView companies={filtered} onToggleMilestone={toggleMilestone} onUpdateProgress={updateMilestoneProgress} onUpdateFields={updateMilestoneFields} onDeleteMilestone={deleteMilestone} onProjectStageChange={updateProjectStage} onOpenCompany={(c: any) => { setSelected(c); setView('detail') }} />}
+          {view === 'home' && <HomeView companies={companies} meetings={meetings} closedStages={closedStageNames} onOpen={(c: any) => { openCompany(c, 'home') }} onNew={() => setShowNew(true)} onGoCalendar={() => setView('calendar')} onDeleteMeeting={deleteMeeting} onLinkMeeting={linkMeetingToCompany} />}
+          {view === 'pipeline' && <Pipeline companies={filtered.filter((c: any) => !c.project_stage)} stages={stageRows} onOpen={(c: any) => { openCompany(c, 'pipeline') }} onUpdate={handleStageChange} onOutreachChange={updateOutreachStatus} onRenameStage={renameStage} onAddStage={addStage} />}
+          {view === 'companies' && <Companies companies={aiResult?.matches ?? filtered} onOpen={(c: any) => { openCompany(c, 'companies') }} onNew={() => setShowNew(true)} onOutreachChange={updateOutreachStatus} />}
+          {view === 'projects' && <ProjectsView companies={filtered} onToggleMilestone={toggleMilestone} onUpdateProgress={updateMilestoneProgress} onUpdateFields={updateMilestoneFields} onDeleteMilestone={deleteMilestone} onProjectStageChange={updateProjectStage} onOpenCompany={(c: any) => { openCompany(c, 'projects') }} />}
           {view === 'calendar' && <CalendarView meetings={meetings} companies={companies} googleConn={googleConn} onSync={syncGoogleCalendar} onDeleteMeeting={deleteMeeting} onLinkMeeting={linkMeetingToCompany} />}
           {view === 'tasks' && <Tasks tasks={tasks} companies={companies} onToggle={toggleTask} onAdd={addTask} onDelete={deleteTask} />}
           {view === 'settings' && <SettingsView googleConn={googleConn} profile={profile} user={user} />}
@@ -654,7 +661,8 @@ export default function Page() {
             <Detail
               c={selected}
               stages={stageNames}
-              onBack={() => setView('companies')}
+              onBack={() => setView(cameFrom)}
+              backLabel={cameFrom === 'home' ? 'Today' : cameFrom === 'pipeline' ? 'Sales' : cameFrom === 'projects' ? 'Projects' : 'Companies'}
               onUpdate={handleStageChange}
               onEdit={(c: any) => setEditCompany(c)}
               onDelete={deleteCompany}
@@ -907,14 +915,14 @@ function Companies({ companies, onOpen, onNew, onOutreachChange }: { companies: 
   )
 }
 
-function Detail({ c, stages, onBack, onUpdate, onEdit, onDelete, onAddActivity, onScheduleMeeting, onSaveNotes, deleting, onOutreachChange, onProjectStageChange, onRetainerTierChange, onAddMilestone, onToggleMilestone, onApplyTemplate, onUpdateMilestoneProgress, onDeleteMilestone }: { c: any; stages: string[]; onBack: any; onUpdate: any; onEdit: any; onDelete: any; onAddActivity: any; onScheduleMeeting: any; onSaveNotes: any; deleting?: boolean; onOutreachChange: any; onProjectStageChange: any; onRetainerTierChange: any; onAddMilestone: any; onToggleMilestone: any; onApplyTemplate: any; onUpdateMilestoneProgress: any; onDeleteMilestone: any }) {
+function Detail({ c, stages, onBack, backLabel, onUpdate, onEdit, onDelete, onAddActivity, onScheduleMeeting, onSaveNotes, deleting, onOutreachChange, onProjectStageChange, onRetainerTierChange, onAddMilestone, onToggleMilestone, onApplyTemplate, onUpdateMilestoneProgress, onDeleteMilestone }: { c: any; stages: string[]; onBack: any; backLabel: string; onUpdate: any; onEdit: any; onDelete: any; onAddActivity: any; onScheduleMeeting: any; onSaveNotes: any; deleting?: boolean; onOutreachChange: any; onProjectStageChange: any; onRetainerTierChange: any; onAddMilestone: any; onToggleMilestone: any; onApplyTemplate: any; onUpdateMilestoneProgress: any; onDeleteMilestone: any }) {
   const [tab, setTab] = useState('overview')
   const [notes, setNotes] = useState(c.remarks || '')
   useEffect(() => { setNotes(c.remarks || '') }, [c.id])
   const idx = stages.indexOf(c.lead_status)
   return (
     <>
-      <button className="back" onClick={onBack}>← Companies</button>
+      <button className="back" onClick={onBack}>← {backLabel}</button>
       <div className="detail-head">
         <div className="logo-dot xl">{initials(c.name)}</div>
         <div><div className="eyebrow">COMPANY</div><h1>{c.name}</h1><p>{c.website || 'No website'} · {c.address || 'No address'}</p></div>
