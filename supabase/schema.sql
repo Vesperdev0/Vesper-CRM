@@ -236,12 +236,21 @@ drop trigger if exists on_auth_user_created on auth.users;
 create trigger on_auth_user_created after insert on auth.users for each row execute procedure public.handle_new_user();
 
 -- 2026-09-07: upgrade milestones into a full project-task board (priority, progress, in-progress status)
--- 2026-09-08: currently unused / reserved — nothing in the UI reads or writes these yet:
---   companies.deal_value_min / deal_value_max / deal_value_type  (deal value ranges)
---   opportunities  (multi-deal-per-company model)
---   audit_log      (change history)
---   meetings.meeting_type is written by default only; meetings.status is settable but has no UI
--- Kept so no data is dropped; wire them up or drop them deliberately later.
+-- 2026-09-16: dead-schema status, re-verified against the code rather than assumed.
+--   Still unread and unwritten by every .ts/.tsx file:
+--     companies.deal_value_min / deal_value_max / deal_value_type  (deal value ranges)
+--     companies.facebook, contacts.facebook, contacts.address
+--     opportunities, and the opportunity_id columns on activities / tasks / meetings
+--   → supabase/migrate-drop-unused.sql removes these. It is destructive and opt-in, and it
+--     audits for real data before it will let you drop anything.
+--
+--   No longer dead:
+--     meetings.meeting_type  — the new-meeting form sets it (it used to take the default, so
+--                              every meeting on Today claimed to be a Discovery Call)
+--     profiles.role          — read and shown in Settings; recorded, not yet enforced
+--   Kept on purpose:
+--     audit_log              — still unwritten, but now append-only (see migrate-security.sql)
+--     meetings.status        — set on insert and deliberately preserved across calendar re-sync
 
 alter table milestones add column if not exists priority text not null default 'Medium' check (priority in ('Low','Medium','High'));
 alter table milestones add column if not exists progress smallint not null default 0 check (progress >= 0 and progress <= 100);
