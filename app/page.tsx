@@ -497,10 +497,12 @@ export default function Page() {
     if (error) { alert(error.message); return }
     patchMilestonesLocally(companyId, ms => ms.filter(m => m.id !== milestoneId))
   }
+  // Drag-and-drop between board columns. Goes through updateMilestoneFields so the card moves
+  // immediately and rolls back if the write fails — it used to await the round trip before
+  // moving, so a dragged card visibly hung in its old column until the network answered, while
+  // every other milestone edit on the same board was already optimistic.
   async function toggleMilestone(companyId: string, milestoneId: string, status: string) {
-    const { error } = await supabase.from('milestones').update({ status }).eq('id', milestoneId)
-    if (error) { alert(error.message); return }
-    patchMilestonesLocally(companyId, ms => ms.map(m => (m.id === milestoneId ? { ...m, status } : m)))
+    await updateMilestoneFields(companyId, milestoneId, { status })
   }
   // Skips goals this company already has. The button is permanently visible on the Project tab
   // and inserted blindly before, so a second click silently produced a duplicate of every
