@@ -255,9 +255,13 @@ export default function Page() {
       if (data.session?.user) await loadAll()
       setLoading(false)
     })
-    const { data: l } = supabase.auth.onAuthStateChange(async (_e, s) => {
+    const { data: l } = supabase.auth.onAuthStateChange(async (event, s) => {
       setUser(s?.user || null)
-      if (s?.user) await loadAll()
+      // Only refetch when the identity actually changed. This fired on TOKEN_REFRESHED too,
+      // so the whole workspace — companies, contacts, activities, milestones, tasks, meetings,
+      // stages — was re-downloaded every time Supabase silently rotated the hourly token,
+      // wiping any in-progress optimistic state along with it.
+      if (s?.user && (event === 'SIGNED_IN' || event === 'USER_UPDATED')) await loadAll()
     })
     if (typeof window !== 'undefined') {
       const params = new URLSearchParams(window.location.search)
