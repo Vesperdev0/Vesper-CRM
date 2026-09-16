@@ -1,3 +1,6 @@
+-- VESPER CRM canonical schema. Runs clean on an empty database AND is safe to re-run over
+-- an existing one: tables/columns are `if not exists`, constraints and policies are dropped
+-- by name first, and functions/triggers use `create or replace`.
 create extension if not exists pgcrypto;
 
 -- Defined up here, not next to the companies/contacts/meetings triggers further down:
@@ -174,6 +177,7 @@ revoke all on function public.is_approved() from public;
 grant execute on function public.is_approved() to authenticated;
 
 alter table milestones enable row level security;
+drop policy if exists "approved milestones" on milestones;
 create policy "approved milestones" on milestones for all to authenticated using (public.is_approved()) with check (public.is_approved());
 create or replace trigger milestones_updated before update on milestones for each row execute function set_updated_at();
 
@@ -187,14 +191,23 @@ alter table meetings enable row level security;
 alter table calendar_connections enable row level security;
 alter table audit_log enable row level security;
 
+drop policy if exists "own or approved profiles" on profiles;
 create policy "own or approved profiles" on profiles for select to authenticated using (id = auth.uid() or public.is_approved());
+drop policy if exists "approved companies" on companies;
 create policy "approved companies" on companies for all to authenticated using (public.is_approved()) with check (public.is_approved());
+drop policy if exists "approved contacts" on contacts;
 create policy "approved contacts" on contacts for all to authenticated using (public.is_approved()) with check (public.is_approved());
+drop policy if exists "approved opportunities" on opportunities;
 create policy "approved opportunities" on opportunities for all to authenticated using (public.is_approved()) with check (public.is_approved());
+drop policy if exists "approved activities" on activities;
 create policy "approved activities" on activities for all to authenticated using (public.is_approved()) with check (public.is_approved());
+drop policy if exists "approved tasks" on tasks;
 create policy "approved tasks" on tasks for all to authenticated using (public.is_approved()) with check (public.is_approved());
+drop policy if exists "approved meetings" on meetings;
 create policy "approved meetings" on meetings for all to authenticated using (public.is_approved()) with check (public.is_approved());
+drop policy if exists "own calendar connection" on calendar_connections;
 create policy "own calendar connection" on calendar_connections for all to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid());
+drop policy if exists "approved audit" on audit_log;
 create policy "approved audit" on audit_log for all to authenticated using (public.is_approved()) with check (public.is_approved());
 
 -- Accounts that already existed when this ran are the founding staff: admin + approved.
