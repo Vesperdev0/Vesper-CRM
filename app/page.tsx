@@ -664,12 +664,17 @@ function Nav({ active, icon, label, onClick }: { active: boolean; icon: any; lab
 function HomeView({ companies, meetings, closedStages, onOpen, onNew, onGoCalendar, onDeleteMeeting, onLinkMeeting }: { companies: any[]; meetings: any[]; closedStages: string[]; onOpen: any; onNew: any; onGoCalendar: any; onDeleteMeeting: any; onLinkMeeting: any }) {
   const upcoming = meetings.filter(m => new Date(m.starts_at) >= new Date(Date.now() - 3600000)).sort((a, b) => a.starts_at.localeCompare(b.starts_at))
   const qualified = companies.filter(c => c.lead_status === 'Qualified Lead').length
+  // Both top-line numbers used to run over `companies` unfiltered, so a lost deal and a client
+  // already delivered still counted as a prospect and still inflated pipeline value forever.
+  // "Open" = not on a terminal sales stage and not handed over to delivery — the same test the
+  // stalled-leads panel below already uses.
+  const openCompanies = companies.filter(c => !closedStages.includes(c.lead_status) && !c.project_stage)
+  const openValue = openCompanies.reduce((sum, c) => sum + (c.deal_value || 0), 0)
 
   // Real stalled-opportunity detection, replacing the placeholder card that used to claim this
   // existed. "Stalled" = an open (not closed/lost/future, not handed to delivery) company with
   // no logged activity, and no update to the record itself, in the last 14 days.
-  const stalled = companies
-    .filter(c => !closedStages.includes(c.lead_status) && !c.project_stage)
+  const stalled = openCompanies
     .map(c => {
       const lastActivity = (c.activities || []).reduce((max: string | null, a: any) => (!max || a.occurred_at > max) ? a.occurred_at : max, null)
       const lastTouch = lastActivity || c.updated_at
@@ -684,10 +689,10 @@ function HomeView({ companies, meetings, closedStages, onOpen, onNew, onGoCalend
     <>
       <div className="page-title"><div><div className="eyebrow">OUTREACH CRM</div><h1>Good morning.</h1><p>Here’s what needs your attention.</p></div><button className="ghost" onClick={onNew}><Plus /> Add prospect</button></div>
       <div className="metrics">
-        <Metric label="Prospects" value={companies.length} />
+        <Metric label="Open prospects" value={openCompanies.length} />
         <Metric label="Qualified leads" value={qualified} />
         <Metric label="Meetings" value={upcoming.length} />
-        <Metric label="Pipeline value" value={money(companies.reduce((s, c) => s + (c.deal_value || 0), 0))} />
+        <Metric label="Open pipeline value" value={money(openValue)} />
       </div>
       <div className="grid2">
         <section className="panel">
