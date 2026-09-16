@@ -396,6 +396,39 @@ export default function Page() {
     if (error) { alert(error.message); return }
     await loadStages()
   }
+  // Stages could be added and renamed but never removed, so a typo'd or obsolete column was
+  // permanent. Refuses while companies still sit on it rather than orphaning them on a
+  // lead_status no column renders — companies carry the stage by name, so a silent delete
+  // would make those rows vanish from the board entirely.
+  async function deleteStage(stage: any) {
+    if (!stage.id) { alert('Run supabase/migrate-pipeline.sql first — stages are still the built-in defaults.'); return }
+    const occupants = companies.filter(c => c.lead_status === stage.name && !c.project_stage).length
+    if (occupants) { alert(`"${stage.name}" still has ${occupants} ${occupants === 1 ? 'company' : 'companies'}. Move them to another stage first.`); return }
+    if (stageRows.filter(x => x.kind === 'open').length <= 1 && stage.kind === 'open') { alert('Keep at least one open stage.'); return }
+    if (!confirm(`Delete the "${stage.name}" stage? This cannot be undone.`)) return
+    const { error } = await supabase.from('pipeline_stages').delete().eq('id', stage.id)
+    if (error) { alert(error.message); return }
+    await loadStages()
+  }
+
+  // Swaps this stage's position with its neighbour in the given direction.
+  async function moveStage(stage: any, dir: -1 | 1) {
+    if (!stage.id) { alert('Run supabase/migrate-pipeline.sql first — stages are still the built-in defaults.'); return }
+    const ordered = [...stageRows].sort((a, b) => a.position - b.position)
+    const i = ordered.findIndex(x => x.id === stage.id)
+    const j = i + dir
+    if (i < 0 || j < 0 || j >= ordered.length) return
+    const other = ordered[j]
+    const [a, b] = [stage.position, other.position]
+    const [r1, r2] = await Promise.all([
+      supabase.from('pipeline_stages').update({ position: b }).eq('id', stage.id),
+      supabase.from('pipeline_stages').update({ position: a }).eq('id', other.id),
+    ])
+    const err = r1.error || r2.error
+    if (err) { alert(err.message); await loadStages(); return }
+    await loadStages()
+  }
+
   async function handleSaveNotes(id: string, remarks: string) {
     const updated = await updateCompany(id, { remarks })
     if (updated && selected?.id === id) setSelected(updated)
@@ -651,7 +684,7 @@ export default function Page() {
         </header>
         <div className="content">
           {view === 'home' && <HomeView companies={companies} meetings={meetings} closedStages={closedStageNames} onOpen={(c: any) => { openCompany(c, 'home') }} onNew={() => setShowNew(true)} onGoCalendar={() => setView('calendar')} onDeleteMeeting={deleteMeeting} onLinkMeeting={linkMeetingToCompany} />}
-          {view === 'pipeline' && <Pipeline companies={filtered.filter((c: any) => !c.project_stage)} stages={stageRows} onOpen={(c: any) => { openCompany(c, 'pipeline') }} onUpdate={handleStageChange} onOutreachChange={updateOutreachStatus} onRenameStage={renameStage} onAddStage={addStage} />}
+          {view === 'pipeline' && <Pipeline companies={filtered.filter((c: any) => !c.project_stage)} stages={stageRows} onOpen={(c: any) => { openCompany(c, 'pipeline') }} onUpdate={handleStageChange} onOutreachChange={updateOutreachStatus} onRenameStage={renameStage} onAddStage={addStage} onDeleteStage={deleteStage} onMoveStage={moveStage} />}
           {view === 'companies' && <Companies companies={aiResult?.matches ?? filtered} onOpen={(c: any) => { openCompany(c, 'companies') }} onNew={() => setShowNew(true)} onOutreachChange={updateOutreachStatus} />}
           {view === 'projects' && <ProjectsView companies={filtered} onToggleMilestone={toggleMilestone} onUpdateProgress={updateMilestoneProgress} onUpdateFields={updateMilestoneFields} onDeleteMilestone={deleteMilestone} onProjectStageChange={updateProjectStage} onOpenCompany={(c: any) => { openCompany(c, 'projects') }} />}
           {view === 'calendar' && <CalendarView meetings={meetings} companies={companies} googleConn={googleConn} onSync={syncGoogleCalendar} onDeleteMeeting={deleteMeeting} onLinkMeeting={linkMeetingToCompany} />}
@@ -834,7 +867,7 @@ function Attention({ icon, title, text, onClick }: { icon: any; title: string; t
 function Empty({ title, text }: { title: string; text: string }) { return <div className="empty"><b>{title}</b><p>{text}</p></div> }
 function Status({ s }: { s: string }) { return <span className={'status ' + s.toLowerCase().replaceAll(' ', '-')}>{s}</span> }
 
-function Pipeline({ companies, stages, onOpen, onUpdate, onOutreachChange, onRenameStage, onAddStage }: { companies: any[]; stages: any[]; onOpen: any; onUpdate: any; onOutreachChange: any; onRenameStage: any; onAddStage: any }) {
+function Pipeline({ companies, stages, onOpen, onUpdate, onOutreachChange, onRenameStage, onAddStage, onDeleteStage, onMoveStage }: { companies: any[]; stages: any[]; onOpen: any; onUpdate: any; onOutreachChange: any; onRenameStage: any; onAddStage: any; onDeleteStage: any; onMoveStage: any }) {
   const [dragId, setDragId] = useState<string | null>(null)
   return (
     <>
@@ -845,7 +878,10 @@ function Pipeline({ companies, stages, onOpen, onUpdate, onOutreachChange, onRen
             <div className="col-head">
               <b>{stage}</b>
               <span className="col-tools">
+                <button className="col-edit" title="Move left" onClick={() => onMoveStage(s, -1)}>‹</button>
+                <button className="col-edit" title="Move right" onClick={() => onMoveStage(s, 1)}>›</button>
                 <button className="col-edit" title="Rename stage" onClick={() => onRenameStage(s)}><Pencil /></button>
+                <button className="col-edit" title="Delete stage" onClick={() => onDeleteStage(s)}><Trash2 /></button>
                 {companies.filter(c => c.lead_status === stage).length}
               </span>
             </div>
