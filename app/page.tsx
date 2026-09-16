@@ -51,6 +51,18 @@ const projectStages = [
   'Live / Handover',
   'Retainer Active / Project Closed',
 ]
+// The three project board columns, in board order. Both boards and the card status dropdown
+// read this, so a column and its dropdown option can never drift apart.
+const milestoneStatuses: { key: string; label: string }[] = [
+  { key: 'pending', label: 'Not started' },
+  { key: 'in_progress', label: 'In progress' },
+  { key: 'done', label: 'Done' },
+]
+// 'missed' is a real status the table view can set, but it isn't a column — it buckets into
+// "Not started" and shows as a red chip. Keeping the dropdown on the bucket means the control
+// always agrees with the column the card is actually sitting in.
+const bucketOfMilestone = (m: any) => (m.status === 'in_progress' ? 'in_progress' : m.status === 'done' ? 'done' : 'pending')
+
 const retainerTiers = ['maintenance', 'growth', 'full-service']
 // Standard recurring goals per tier, taken directly from the Retainer SOP's tier tables —
 // Maintenance has no SOP-mandated recurring deliverable beyond the update allowance itself.
@@ -851,6 +863,25 @@ function ProgressInput({ value, onCommit }: { value: number; onCommit: (v: numbe
   )
 }
 
+// Direct-edit status on a project card, mirroring the outreach_status select on Pipeline cards.
+// Additive: dragging the card between columns still works and goes through the same handler, so
+// both paths share the optimistic update and the rollback-on-failure.
+function MilestoneStatusSelect({ milestone, onChange }: { milestone: any; onChange: (status: string) => void }) {
+  return (
+    <select
+      className="outreach-select"
+      value={bucketOfMilestone(milestone)}
+      draggable={false}
+      onClick={e => e.stopPropagation()}
+      // Stops a click-and-drag on the select from picking up the card instead.
+      onDragStart={e => { e.preventDefault(); e.stopPropagation() }}
+      onChange={e => onChange(e.target.value)}
+    >
+      {milestoneStatuses.map(s => <option key={s.key} value={s.key}>{s.label}</option>)}
+    </select>
+  )
+}
+
 function MeetingCompanyPicker({ meeting, companies, onLink, compact }: { meeting: any; companies: any[]; onLink: any; compact?: boolean }) {
   return (
     <select
@@ -1054,12 +1085,8 @@ function ProjectPanel({ c, onStageChange, onTierChange, onAddMilestone, onToggle
     onAddMilestone(c, { title: title.trim(), cadence, category, priority, target_date: targetDate ? new Date(targetDate).toISOString() : undefined })
     setTitle(''); setTargetDate('')
   }
-  const columns: { key: string; label: string }[] = [
-    { key: 'pending', label: 'Not started' },
-    { key: 'in_progress', label: 'In progress' },
-    { key: 'done', label: 'Done' },
-  ]
-  const bucketOf = (m: any) => (m.status === 'in_progress' ? 'in_progress' : m.status === 'done' ? 'done' : 'pending')
+  const columns = milestoneStatuses
+  const bucketOf = bucketOfMilestone
   return (
     <>
       <div className="detail-grid">
@@ -1134,6 +1161,7 @@ function ProjectPanel({ c, onStageChange, onTierChange, onAddMilestone, onToggle
                         {m.target_date && <span className="chip">{new Date(m.target_date).toLocaleDateString()}</span>}
                         {isOverdue(m) && <span className="chip overdue">{m.status === 'missed' ? 'Missed' : 'Overdue'}</span>}
                       </div>
+                      <MilestoneStatusSelect milestone={m} onChange={st => onToggleMilestone(c.id, m.id, st)} />
                       <div className="progress-track"><div className="progress-fill" style={{ width: `${m.progress ?? 0}%` }} /></div>
                       <div className="progress-row">
                         <ProgressInput value={m.progress ?? 0} onCommit={v => onUpdateProgress(c.id, m.id, v)} />
@@ -1270,7 +1298,7 @@ function ProjectsView({ companies, onToggleMilestone, onUpdateProgress, onUpdate
   const [priorityFilter, setPriorityFilter] = useState('all')
   const [companyFilter, setCompanyFilter] = useState('all')
   const [drag, setDrag] = useState<{ id: string; companyId: string } | null>(null)
-  const bucketOf = (m: any) => (m.status === 'in_progress' ? 'in_progress' : m.status === 'done' ? 'done' : 'pending')
+  const bucketOf = bucketOfMilestone
   const all = companies.flatMap((c: any) => (c.milestones || []).map((m: any) => ({ ...m, companyName: c.name, companyId: c.id })))
   const withTasks = companies.filter((c: any) => (c.milestones || []).length)
   const filtered = all.filter((m: any) =>
@@ -1278,11 +1306,7 @@ function ProjectsView({ companies, onToggleMilestone, onUpdateProgress, onUpdate
     (statusFilter === 'all' || bucketOf(m) === statusFilter) &&
     (companyFilter === 'all' || m.companyId === companyFilter)
   )
-  const columns: { key: string; label: string }[] = [
-    { key: 'pending', label: 'Not started' },
-    { key: 'in_progress', label: 'In progress' },
-    { key: 'done', label: 'Done' },
-  ]
+  const columns = milestoneStatuses
   function openCompany(companyId: string) {
     const full = companies.find((c: any) => c.id === companyId)
     if (full) onOpenCompany(full)
@@ -1306,9 +1330,7 @@ function ProjectsView({ companies, onToggleMilestone, onUpdateProgress, onUpdate
           </select>
           <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)}>
             <option value="all">All statuses</option>
-            <option value="pending">Not started</option>
-            <option value="in_progress">In progress</option>
-            <option value="done">Done</option>
+            {milestoneStatuses.map(st => <option key={st.key} value={st.key}>{st.label}</option>)}
           </select>
           <select value={priorityFilter} onChange={e => setPriorityFilter(e.target.value)}>
             <option value="all">All priorities</option>
@@ -1371,6 +1393,7 @@ function ProjectsView({ companies, onToggleMilestone, onUpdateProgress, onUpdate
                       {m.target_date && <span className="chip">{new Date(m.target_date).toLocaleDateString()}</span>}
                       {isOverdue(m) && <span className="chip overdue">{m.status === 'missed' ? 'Missed' : 'Overdue'}</span>}
                     </div>
+                    <MilestoneStatusSelect milestone={m} onChange={st => onToggleMilestone(m.companyId, m.id, st)} />
                     <div className="progress-track"><div className="progress-fill" style={{ width: `${m.progress ?? 0}%` }} /></div>
                     <div className="progress-row">
                       <ProgressInput value={m.progress ?? 0} onCommit={v => onUpdateProgress(m.companyId, m.id, v)} />
