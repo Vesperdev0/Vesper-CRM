@@ -23,6 +23,10 @@ const defaultStageRows: any[] = [
 const outreachStatuses = ['Not Contacted', 'DM Reply', 'DM No Reply', 'Call Successful', 'Call Failed']
 const siteOptions = ['No Site','Not Working','Outdated','Not Good','Coming Soon / Under Construction','Decent','Good']
 const clientTypes = ['old','not active','active','very active']
+// meetings.meeting_type had a DB default of 'Discovery Call' and no UI, so every meeting ever
+// created reported itself as a discovery call on the Today view regardless of what it was.
+const meetingTypes = ['Discovery Call', 'Close Call', 'Onboarding Call', 'Project Review', 'Retainer Review', 'Check-in', 'Other']
+
 const activityTypes = [
   { value: 'call', label: 'Call' },
   { value: 'email', label: 'Email' },
@@ -47,6 +51,18 @@ const projectStages = [
   'Live / Handover',
   'Retainer Active / Project Closed',
 ]
+// The three project board columns, in board order. Both boards and the card status dropdown
+// read this, so a column and its dropdown option can never drift apart.
+const milestoneStatuses: { key: string; label: string }[] = [
+  { key: 'pending', label: 'Not started' },
+  { key: 'in_progress', label: 'In progress' },
+  { key: 'done', label: 'Done' },
+]
+// 'missed' is a real status the table view can set, but it isn't a column — it buckets into
+// "Not started" and shows as a red chip. Keeping the dropdown on the bucket means the control
+// always agrees with the column the card is actually sitting in.
+const bucketOfMilestone = (m: any) => (m.status === 'in_progress' ? 'in_progress' : m.status === 'done' ? 'done' : 'pending')
+
 const retainerTiers = ['maintenance', 'growth', 'full-service']
 // Standard recurring goals per tier, taken directly from the Retainer SOP's tier tables —
 // Maintenance has no SOP-mandated recurring deliverable beyond the update allowance itself.
@@ -81,18 +97,39 @@ function fmtDate(d: string | null | undefined) {
 // The "ask VESPER" matcher — plain keyword rules, no external AI service. Pure function so the
 // result can be derived fresh whenever companies change (the old version ran once via a stale
 // setTimeout closure and answered the PREVIOUS question). Rules narrow cumulatively.
-function runAIQuery(query: string, companies: any[]) {
-  const s = query.toLowerCase()
+//
+// Returns null when nothing matched, which is the point of this rewrite: the old version always
+// returned an array, so an unparsed question produced a confident "VESPER found 0" that was
+// indistinguishable from a real empty result. Two rules were also actively wrong — the place
+// filter took the LAST word of the sentence regardless of where "in" was ("deals in progress"
+// searched addresses for "progress"), and the `state` test also fired on the word "status".
+function runAIQuery(query: string, companies: any[]): any[] | null {
+  const s = query.toLowerCase().trim()
   let r = companies
-  if (s.includes('state') || s.includes('city') || s.includes('in ')) {
-    const words = s.split(/\s+/)
-    const candidate = words[words.length - 1].replace(/[?.]/g, '')
-    r = r.filter(c => (c.address || '').toLowerCase().includes(candidate))
+  let matched = false
+
+  // Words that commonly follow "in" without naming a place — without these, "deals in progress"
+  // searches addresses for "progress" and reports a confident zero.
+  const notPlaces = new Set(['progress', 'play', 'person', 'total', 'general', 'detail', 'review', 'order', 'touch', 'future', 'the pipeline', 'pipeline'])
+
+  // Take what follows "in", not the end of the sentence.
+  const place = s.match(/\bin\s+([a-z][a-z\s]*?)\s*[?.!]*$/)
+  if (place) {
+    const p = place[1].trim()
+    if (p.length > 2 && !notPlaces.has(p)) { r = r.filter(c => (c.address || '').toLowerCase().includes(p)); matched = true }
   }
-  if (s.includes('qualified')) r = r.filter(c => c.lead_status === 'Qualified Lead')
-  if (s.includes('website') && s.includes('no')) r = r.filter(c => c.site_condition === 'No Site')
-  if (s.includes('meeting')) r = r.filter(c => c.activities?.some((a: any) => a.type === 'meeting'))
-  return r
+  if (/\bqualified\b/.test(s)) { r = r.filter(c => c.lead_status === 'Qualified Lead'); matched = true }
+  if (/\bno\s+(website|site)\b/.test(s)) { r = r.filter(c => c.site_condition === 'No Site'); matched = true }
+  if (/\bmeetings?\b/.test(s)) { r = r.filter(c => c.activities?.some((a: any) => a.type === 'meeting')); matched = true }
+  if (/\b(gbp|google business)\b/.test(s)) { r = r.filter(c => c.gbp); matched = true }
+  if (/\bstalled?\b/.test(s)) {
+    r = r.filter(c => {
+      const last = (c.activities || []).reduce((max: string | null, a: any) => (!max || a.occurred_at > max) ? a.occurred_at : max, null) || c.updated_at
+      return !last || Date.now() - new Date(last).getTime() >= 14 * 86400000
+    })
+    matched = true
+  }
+  return matched ? r : null
 }
 // A milestone counts as overdue when it isn't done and its target date has passed (or the DB
 // says 'missed' — a status the schema always had but the boards used to silently bucket into
@@ -110,8 +147,12 @@ export default function Page() {
   const [tasks, setTasks] = useState<any[]>([])
   const [meetings, setMeetings] = useState<any[]>([])
   const [googleConn, setGoogleConn] = useState<any>(null)
+  const [profile, setProfile] = useState<any>(null)
   const [view, setView] = useState('home')
   const [selected, setSelected] = useState<any>(null)
+  // Where opening this company came from, so the detail page's back button returns there
+  // instead of always dumping you on Companies regardless of where you started.
+  const [cameFrom, setCameFrom] = useState('companies')
   const [dark, setDark] = useState(false)
   const [q, setQ] = useState('')
   const [showNew, setShowNew] = useState(false)
@@ -126,6 +167,10 @@ export default function Page() {
   const stageNames = useMemo(() => stageRows.map(s => s.name), [stageRows])
   const wonStageNames = useMemo(() => stageRows.filter(s => s.kind === 'won').map(s => s.name), [stageRows])
   const closedStageNames = useMemo(() => stageRows.filter(s => s.kind !== 'open').map(s => s.name), [stageRows])
+
+  function openCompany(c: any, from: string) {
+    setSelected(c); setCameFrom(from); setView('detail')
+  }
 
   async function loadStages() {
     const { data, error } = await supabase.from('pipeline_stages').select('*').order('position')
@@ -144,6 +189,17 @@ export default function Page() {
   async function loadMeetings() {
     const { data: mt } = await supabase.from('meetings').select('*,companies(name)').order('starts_at', { ascending: true })
     setMeetings(mt || [])
+  }
+
+  // Settings used to state flatly that "Roles are stored in your VESPER profiles" while
+  // nothing in the app had ever read profiles. Read the real row so the claim is true, and so
+  // an account that hasn't been approved yet can be told that instead of seeing empty boards.
+  async function loadProfile() {
+    const { data: auth } = await supabase.auth.getUser()
+    if (!auth.user) { setProfile(null); return }
+    const { data } = await supabase.from('profiles')
+      .select('id,username,display_name,role,approved').eq('id', auth.user.id).maybeSingle()
+    setProfile(data || null)
   }
 
   async function loadGoogleConn() {
@@ -166,7 +222,7 @@ export default function Page() {
     ])
     setCompanies((comp || []).map((x: any) => ({ ...x, contact: x.contacts?.[0] || null })))
     setTasks(tk || [])
-    await Promise.all([loadMeetings(), loadGoogleConn(), loadStages()])
+    await Promise.all([loadMeetings(), loadGoogleConn(), loadStages(), loadProfile()])
   }
 
   async function syncGoogleCalendar(manual = false) {
@@ -177,6 +233,17 @@ export default function Page() {
       return
     }
     await loadMeetings()
+  }
+
+  // Calendar sync imports Google events with company_id null, and until now there was no way
+  // to ever set it — the sync route's own comment said to "link it to a company by hand from
+  // the Companies view", but no such control existed anywhere, so every event created in
+  // Google rather than in VESPER was stuck rendering as "—".
+  async function linkMeetingToCompany(meetingId: string, companyId: string) {
+    const { data, error } = await supabase.from('meetings')
+      .update({ company_id: companyId || null }).eq('id', meetingId).select('*,companies(name)').single()
+    if (error) { alert(error.message); return }
+    setMeetings(x => x.map(m => (m.id === meetingId ? data : m)))
   }
 
   async function deleteMeeting(m: any) {
@@ -200,9 +267,13 @@ export default function Page() {
       if (data.session?.user) await loadAll()
       setLoading(false)
     })
-    const { data: l } = supabase.auth.onAuthStateChange(async (_e, s) => {
+    const { data: l } = supabase.auth.onAuthStateChange(async (event, s) => {
       setUser(s?.user || null)
-      if (s?.user) await loadAll()
+      // Only refetch when the identity actually changed. This fired on TOKEN_REFRESHED too,
+      // so the whole workspace — companies, contacts, activities, milestones, tasks, meetings,
+      // stages — was re-downloaded every time Supabase silently rotated the hourly token,
+      // wiping any in-progress optimistic state along with it.
+      if (s?.user && (event === 'SIGNED_IN' || event === 'USER_UPDATED')) await loadAll()
     })
     if (typeof window !== 'undefined') {
       const params = new URLSearchParams(window.location.search)
@@ -246,8 +317,12 @@ export default function Page() {
   }, [companies, q])
 
   // Non-null while an "ask VESPER" query is active; recomputed from live data so the filtered
-  // list stays correct after edits instead of showing a snapshot.
-  const aiMatches = useMemo(() => (aiQuery == null ? null : runAIQuery(aiQuery, companies)), [aiQuery, companies])
+  // list stays correct after edits instead of showing a snapshot. `.matches` is null when no
+  // rule understood the question — distinct from a rule matching zero companies.
+  const aiResult = useMemo(
+    () => (aiQuery == null ? null : { q: aiQuery, matches: runAIQuery(aiQuery, companies) }),
+    [aiQuery, companies]
+  )
 
   async function login(e: React.FormEvent) {
     e.preventDefault()
@@ -260,7 +335,7 @@ export default function Page() {
   }
   async function logout() {
     await supabase.auth.signOut()
-    setUser(null); setCompanies([]); setTasks([]); setMeetings([]); setSelected(null); setAiQuery(null); setView('home')
+    setUser(null); setCompanies([]); setTasks([]); setMeetings([]); setProfile(null); setSelected(null); setAiQuery(null); setView('home')
   }
 
   async function addCompany(c: any) {
@@ -337,6 +412,39 @@ export default function Page() {
     if (error) { alert(error.message); return }
     await loadStages()
   }
+  // Stages could be added and renamed but never removed, so a typo'd or obsolete column was
+  // permanent. Refuses while companies still sit on it rather than orphaning them on a
+  // lead_status no column renders — companies carry the stage by name, so a silent delete
+  // would make those rows vanish from the board entirely.
+  async function deleteStage(stage: any) {
+    if (!stage.id) { alert('Run supabase/migrate-pipeline.sql first — stages are still the built-in defaults.'); return }
+    const occupants = companies.filter(c => c.lead_status === stage.name && !c.project_stage).length
+    if (occupants) { alert(`"${stage.name}" still has ${occupants} ${occupants === 1 ? 'company' : 'companies'}. Move them to another stage first.`); return }
+    if (stageRows.filter(x => x.kind === 'open').length <= 1 && stage.kind === 'open') { alert('Keep at least one open stage.'); return }
+    if (!confirm(`Delete the "${stage.name}" stage? This cannot be undone.`)) return
+    const { error } = await supabase.from('pipeline_stages').delete().eq('id', stage.id)
+    if (error) { alert(error.message); return }
+    await loadStages()
+  }
+
+  // Swaps this stage's position with its neighbour in the given direction.
+  async function moveStage(stage: any, dir: -1 | 1) {
+    if (!stage.id) { alert('Run supabase/migrate-pipeline.sql first — stages are still the built-in defaults.'); return }
+    const ordered = [...stageRows].sort((a, b) => a.position - b.position)
+    const i = ordered.findIndex(x => x.id === stage.id)
+    const j = i + dir
+    if (i < 0 || j < 0 || j >= ordered.length) return
+    const other = ordered[j]
+    const [a, b] = [stage.position, other.position]
+    const [r1, r2] = await Promise.all([
+      supabase.from('pipeline_stages').update({ position: b }).eq('id', stage.id),
+      supabase.from('pipeline_stages').update({ position: a }).eq('id', other.id),
+    ])
+    const err = r1.error || r2.error
+    if (err) { alert(err.message); await loadStages(); return }
+    await loadStages()
+  }
+
   async function handleSaveNotes(id: string, remarks: string) {
     const updated = await updateCompany(id, { remarks })
     if (updated && selected?.id === id) setSelected(updated)
@@ -378,10 +486,20 @@ export default function Page() {
   }
   // Optimistic single-field (or multi-field) milestone edit — the table view edits everything
   // (title, status, priority, dates, cadence, category) through this one path.
+  // Rolls back on failure: this used to paint the new value, alert, and then leave the value
+  // that never saved sitting on screen until a reload, so a rejected edit looked like it worked.
   async function updateMilestoneFields(companyId: string, milestoneId: string, patch: any) {
+    const before = (companies.find(c => c.id === companyId)?.milestones || []).find((m: any) => m.id === milestoneId)
     patchMilestonesLocally(companyId, ms => ms.map(m => (m.id === milestoneId ? { ...m, ...patch } : m)))
     const { error } = await supabase.from('milestones').update(patch).eq('id', milestoneId)
-    if (error) alert(error.message)
+    if (error) {
+      // Restore only the fields this call touched, so a concurrent edit to another field survives.
+      if (before) {
+        const revert = Object.fromEntries(Object.keys(patch).map(k => [k, before[k]]))
+        patchMilestonesLocally(companyId, ms => ms.map(m => (m.id === milestoneId ? { ...m, ...revert } : m)))
+      }
+      alert(error.message)
+    }
   }
   async function updateMilestoneProgress(companyId: string, milestoneId: string, progress: number) {
     await updateMilestoneFields(companyId, milestoneId, { progress })
@@ -391,16 +509,24 @@ export default function Page() {
     if (error) { alert(error.message); return }
     patchMilestonesLocally(companyId, ms => ms.filter(m => m.id !== milestoneId))
   }
+  // Drag-and-drop between board columns. Goes through updateMilestoneFields so the card moves
+  // immediately and rolls back if the write fails — it used to await the round trip before
+  // moving, so a dragged card visibly hung in its old column until the network answered, while
+  // every other milestone edit on the same board was already optimistic.
   async function toggleMilestone(companyId: string, milestoneId: string, status: string) {
-    const { error } = await supabase.from('milestones').update({ status }).eq('id', milestoneId)
-    if (error) { alert(error.message); return }
-    patchMilestonesLocally(companyId, ms => ms.map(m => (m.id === milestoneId ? { ...m, status } : m)))
+    await updateMilestoneFields(companyId, milestoneId, { status })
   }
+  // Skips goals this company already has. The button is permanently visible on the Project tab
+  // and inserted blindly before, so a second click silently produced a duplicate of every
+  // standard goal — and nothing in the UI hinted that it already ran once.
   async function applyRetainerTemplate(company: any, tier: string) {
     const template = retainerGoalTemplates[tier] || []
     if (!template.length) return
+    const existing = new Set((company.milestones || []).map((m: any) => m.title))
+    const missing = template.filter(t => !existing.has(t.title))
+    if (!missing.length) { alert(`Every standard ${tier} goal is already on this company.`); return }
     const { data, error } = await supabase.from('milestones').insert(
-      template.map(t => ({ company_id: company.id, title: t.title, cadence: t.cadence, category: 'goal' }))
+      missing.map(t => ({ company_id: company.id, title: t.title, cadence: t.cadence, category: 'goal' }))
     ).select()
     if (error) { alert(error.message); return }
     patchMilestonesLocally(company.id, ms => [...ms, ...(data || [])])
@@ -464,7 +590,7 @@ export default function Page() {
       if (error) { alert(error.message); return }
       setCompanies(x => x.filter(z => z.id !== id))
       setMeetings(x => x.filter(m => m.company_id !== id))
-      setSelected(null); setView('companies')
+      setSelected(null); setView(cameFrom)
     } finally {
       setDeletingId(null)
     }
@@ -497,7 +623,7 @@ export default function Page() {
     setTasks(x => x.filter(t => t.id !== id))
   }
 
-  async function scheduleMeeting(company: any, m: { title: string; starts_at: string; ends_at: string; location?: string }) {
+  async function scheduleMeeting(company: any, m: { title: string; meeting_type: string; starts_at: string; ends_at: string; location?: string }) {
     // The Google Calendar round trip (creating the event + provisioning a Meet link) is the one
     // genuinely slow step here and can't be shortened from our side — but everything that used
     // to run strictly AFTER it in sequence didn't need to: auth.getUser() doesn't depend on the
@@ -518,8 +644,8 @@ export default function Page() {
     const auth = authRes.data
     const ev = json.event
     const { data: row, error } = await supabase.from('meetings').insert({
-      company_id: company.id, created_by: auth.user?.id, title: m.title, starts_at: m.starts_at, ends_at: m.ends_at,
-      location: m.location || null, google_event_id: ev?.id || null, google_calendar_id: 'primary',
+      company_id: company.id, created_by: auth.user?.id, title: m.title, meeting_type: m.meeting_type, starts_at: m.starts_at, ends_at: m.ends_at,
+      location: m.location || null, google_event_id: ev?.id || null, google_calendar_id: json.calendarId || 'primary',
       google_meet_url: ev?.hangoutLink || null, status: 'scheduled',
     }).select('*,companies(name)').single()
     if (error) { alert(error.message); return }
@@ -575,18 +701,19 @@ export default function Page() {
           </div>
         </header>
         <div className="content">
-          {view === 'home' && <HomeView companies={companies} meetings={meetings} closedStages={closedStageNames} onOpen={(c: any) => { setSelected(c); setView('detail') }} onNew={() => setShowNew(true)} onGoCalendar={() => setView('calendar')} onDeleteMeeting={deleteMeeting} />}
-          {view === 'pipeline' && <Pipeline companies={filtered.filter((c: any) => !c.project_stage)} stages={stageRows} onOpen={(c: any) => { setSelected(c); setView('detail') }} onUpdate={handleStageChange} onOutreachChange={updateOutreachStatus} onRenameStage={renameStage} onAddStage={addStage} />}
-          {view === 'companies' && <Companies companies={aiMatches ?? filtered} onOpen={(c: any) => { setSelected(c); setView('detail') }} onNew={() => setShowNew(true)} onOutreachChange={updateOutreachStatus} />}
-          {view === 'projects' && <ProjectsView companies={companies} onToggleMilestone={toggleMilestone} onUpdateProgress={updateMilestoneProgress} onUpdateFields={updateMilestoneFields} onDeleteMilestone={deleteMilestone} onProjectStageChange={updateProjectStage} onOpenCompany={(c: any) => { setSelected(c); setView('detail') }} />}
-          {view === 'calendar' && <CalendarView meetings={meetings} googleConn={googleConn} onSync={syncGoogleCalendar} onDeleteMeeting={deleteMeeting} />}
+          {view === 'home' && <HomeView companies={companies} meetings={meetings} closedStages={closedStageNames} onOpen={(c: any) => { openCompany(c, 'home') }} onNew={() => setShowNew(true)} onGoCalendar={() => setView('calendar')} onDeleteMeeting={deleteMeeting} onLinkMeeting={linkMeetingToCompany} />}
+          {view === 'pipeline' && <Pipeline companies={filtered.filter((c: any) => !c.project_stage)} stages={stageRows} onOpen={(c: any) => { openCompany(c, 'pipeline') }} onUpdate={handleStageChange} onOutreachChange={updateOutreachStatus} onRenameStage={renameStage} onAddStage={addStage} onDeleteStage={deleteStage} onMoveStage={moveStage} />}
+          {view === 'companies' && <Companies companies={aiResult?.matches ?? filtered} onOpen={(c: any) => { openCompany(c, 'companies') }} onNew={() => setShowNew(true)} onOutreachChange={updateOutreachStatus} />}
+          {view === 'projects' && <ProjectsView companies={filtered} onToggleMilestone={toggleMilestone} onUpdateProgress={updateMilestoneProgress} onUpdateFields={updateMilestoneFields} onDeleteMilestone={deleteMilestone} onProjectStageChange={updateProjectStage} onOpenCompany={(c: any) => { openCompany(c, 'projects') }} />}
+          {view === 'calendar' && <CalendarView meetings={meetings} companies={companies} googleConn={googleConn} onSync={syncGoogleCalendar} onDeleteMeeting={deleteMeeting} onLinkMeeting={linkMeetingToCompany} />}
           {view === 'tasks' && <Tasks tasks={tasks} companies={companies} onToggle={toggleTask} onAdd={addTask} onDelete={deleteTask} />}
-          {view === 'settings' && <SettingsView googleConn={googleConn} />}
+          {view === 'settings' && <SettingsView googleConn={googleConn} profile={profile} user={user} />}
           {view === 'detail' && selected && (
             <Detail
               c={selected}
               stages={stageNames}
-              onBack={() => setView('companies')}
+              onBack={() => setView(cameFrom)}
+              backLabel={cameFrom === 'home' ? 'Today' : cameFrom === 'pipeline' ? 'Sales' : cameFrom === 'projects' ? 'Projects' : 'Companies'}
               onUpdate={handleStageChange}
               onEdit={(c: any) => setEditCompany(c)}
               onDelete={deleteCompany}
@@ -614,12 +741,19 @@ export default function Page() {
         <Nav active={view === 'calendar'} icon={<Calendar />} label="Calendar" onClick={() => setView('calendar')} />
         <Nav active={view === 'tasks'} icon={<CheckCircle2 />} label="Tasks" onClick={() => setView('tasks')} />
       </nav>
-      <button className="ai-fab" onClick={() => { const v = prompt('Ask VESPER anything about your CRM'); if (v) { setAiQuery(v); setView('companies') } }}><Command /></button>
+      <button className="ai-fab" onClick={() => { const v = prompt('Filter companies — try "qualified leads in mumbai", "companies with no website", "stalled", "has GBP"'); if (v) { setAiQuery(v); setView('companies') } }}><Command /></button>
       {showNew && <CompanyForm stages={stageNames} onClose={() => setShowNew(false)} onSave={addCompany} />}
       {editCompany && <CompanyForm stages={stageNames} initial={editCompany} onClose={() => setEditCompany(null)} onSave={(f: any) => saveEditedCompany(editCompany.id, f)} />}
       {showActivity && <AddActivity company={showActivity} onClose={() => setShowActivity(null)} onSave={(a: any) => addActivity(showActivity, a)} />}
       {showMeeting && <NewMeetingForm company={showMeeting} onClose={() => setShowMeeting(null)} onSave={(m: any) => scheduleMeeting(showMeeting, m)} />}
-      {aiMatches != null && <div className="toast"><b>VESPER found {aiMatches.length}</b><button onClick={() => setAiQuery(null)}><X /></button></div>}
+      {aiResult && (
+        <div className="toast">
+          {aiResult.matches
+            ? <b>VESPER found {aiResult.matches.length}</b>
+            : <b>Couldn’t read “{aiResult.q}” — showing everything</b>}
+          <button onClick={() => setAiQuery(null)}><X /></button>
+        </div>
+      )}
     </div>
   )
 }
@@ -628,15 +762,20 @@ function Nav({ active, icon, label, onClick }: { active: boolean; icon: any; lab
   return <button className={active ? 'nav active' : 'nav'} onClick={onClick}>{icon}<span>{label}</span></button>
 }
 
-function HomeView({ companies, meetings, closedStages, onOpen, onNew, onGoCalendar, onDeleteMeeting }: { companies: any[]; meetings: any[]; closedStages: string[]; onOpen: any; onNew: any; onGoCalendar: any; onDeleteMeeting: any }) {
+function HomeView({ companies, meetings, closedStages, onOpen, onNew, onGoCalendar, onDeleteMeeting, onLinkMeeting }: { companies: any[]; meetings: any[]; closedStages: string[]; onOpen: any; onNew: any; onGoCalendar: any; onDeleteMeeting: any; onLinkMeeting: any }) {
   const upcoming = meetings.filter(m => new Date(m.starts_at) >= new Date(Date.now() - 3600000)).sort((a, b) => a.starts_at.localeCompare(b.starts_at))
   const qualified = companies.filter(c => c.lead_status === 'Qualified Lead').length
+  // Both top-line numbers used to run over `companies` unfiltered, so a lost deal and a client
+  // already delivered still counted as a prospect and still inflated pipeline value forever.
+  // "Open" = not on a terminal sales stage and not handed over to delivery — the same test the
+  // stalled-leads panel below already uses.
+  const openCompanies = companies.filter(c => !closedStages.includes(c.lead_status) && !c.project_stage)
+  const openValue = openCompanies.reduce((sum, c) => sum + (c.deal_value || 0), 0)
 
   // Real stalled-opportunity detection, replacing the placeholder card that used to claim this
   // existed. "Stalled" = an open (not closed/lost/future, not handed to delivery) company with
   // no logged activity, and no update to the record itself, in the last 14 days.
-  const stalled = companies
-    .filter(c => !closedStages.includes(c.lead_status) && !c.project_stage)
+  const stalled = openCompanies
     .map(c => {
       const lastActivity = (c.activities || []).reduce((max: string | null, a: any) => (!max || a.occurred_at > max) ? a.occurred_at : max, null)
       const lastTouch = lastActivity || c.updated_at
@@ -651,10 +790,10 @@ function HomeView({ companies, meetings, closedStages, onOpen, onNew, onGoCalend
     <>
       <div className="page-title"><div><div className="eyebrow">OUTREACH CRM</div><h1>Good morning.</h1><p>Here’s what needs your attention.</p></div><button className="ghost" onClick={onNew}><Plus /> Add prospect</button></div>
       <div className="metrics">
-        <Metric label="Prospects" value={companies.length} />
+        <Metric label="Open prospects" value={openCompanies.length} />
         <Metric label="Qualified leads" value={qualified} />
         <Metric label="Meetings" value={upcoming.length} />
-        <Metric label="Pipeline value" value={money(companies.reduce((s, c) => s + (c.deal_value || 0), 0))} />
+        <Metric label="Open pipeline value" value={money(openValue)} />
       </div>
       <div className="grid2">
         <section className="panel">
@@ -662,7 +801,11 @@ function HomeView({ companies, meetings, closedStages, onOpen, onNew, onGoCalend
           {upcoming.length ? upcoming.slice(0, 4).map((m: any) => (
             <div className="meeting" key={m.id}>
               <div className="time"><b>{new Date(m.starts_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</b><span>{new Date(m.starts_at).toLocaleDateString([], { month: 'short', day: 'numeric' })}</span></div>
-              <div><b>{m.companies?.name || '—'}</b><p>{m.meeting_type || 'Meeting'}{m.google_meet_url ? ' · Google Meet' : ''}</p></div>
+              <div>
+                <b>{m.companies?.name || m.title}</b>
+                <p>{m.meeting_type || 'Meeting'}{m.google_meet_url ? ' · Google Meet' : ''}</p>
+                {!m.company_id && <MeetingCompanyPicker meeting={m} companies={companies} onLink={onLinkMeeting} />}
+              </div>
               <button className="icon-btn" onClick={() => onDeleteMeeting(m)} title="Delete meeting"><Trash2 /></button>
             </div>
           )) : <Empty title="No meetings yet" text="Meetings you schedule from a company page will appear here." />}
@@ -696,6 +839,64 @@ function HomeView({ companies, meetings, closedStages, onOpen, onNew, onGoCalend
     </>
   )
 }
+// Shown on any meeting that isn't attached to a company yet — i.e. everything Google sync
+// pulled in. Stops click-through so using it inside a clickable card doesn't navigate away.
+// Commits on blur or Enter rather than on every keystroke. As a number input, holding an arrow
+// key or typing "100" fired one DB write per character — the task title input in the table view
+// was already built this way for exactly this reason; this brings the percentage field in line.
+function ProgressInput({ value, onCommit }: { value: number; onCommit: (v: number) => void }) {
+  const [draft, setDraft] = useState(String(value))
+  // Re-sync when the value changes underneath us (another edit, or a failed write rolling back).
+  useEffect(() => { setDraft(String(value)) }, [value])
+  function commit() {
+    const n = Math.max(0, Math.min(100, Math.round(+draft || 0)))
+    setDraft(String(n))
+    if (n !== value) onCommit(n)
+  }
+  return (
+    <input
+      type="number" min={0} max={100} value={draft}
+      onChange={e => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={e => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
+    />
+  )
+}
+
+// Direct-edit status on a project card, mirroring the outreach_status select on Pipeline cards.
+// Additive: dragging the card between columns still works and goes through the same handler, so
+// both paths share the optimistic update and the rollback-on-failure.
+function MilestoneStatusSelect({ milestone, onChange }: { milestone: any; onChange: (status: string) => void }) {
+  return (
+    <select
+      className="outreach-select"
+      value={bucketOfMilestone(milestone)}
+      draggable={false}
+      onClick={e => e.stopPropagation()}
+      // Stops a click-and-drag on the select from picking up the card instead.
+      onDragStart={e => { e.preventDefault(); e.stopPropagation() }}
+      onChange={e => onChange(e.target.value)}
+    >
+      {milestoneStatuses.map(s => <option key={s.key} value={s.key}>{s.label}</option>)}
+    </select>
+  )
+}
+
+function MeetingCompanyPicker({ meeting, companies, onLink, compact }: { meeting: any; companies: any[]; onLink: any; compact?: boolean }) {
+  return (
+    <select
+      className="outreach-select"
+      style={compact ? { margin: '6px 0 0', fontSize: 9 } : { margin: '6px 0 0', width: 'auto' }}
+      value={meeting.company_id || ''}
+      onClick={e => e.stopPropagation()}
+      onChange={e => { e.stopPropagation(); onLink(meeting.id, e.target.value) }}
+    >
+      <option value="">— link to company —</option>
+      {companies.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+    </select>
+  )
+}
+
 function Metric({ label, value }: { label: string; value: any }) { return <div className="metric"><span>{label}</span><strong>{value}</strong></div> }
 function Attention({ icon, title, text, onClick }: { icon: any; title: string; text: string; onClick?: () => void }) {
   return <div className="attention" onClick={onClick} style={onClick ? { cursor: 'pointer' } : undefined}>{icon}<div><b>{title}</b><p>{text}</p></div></div>
@@ -703,7 +904,7 @@ function Attention({ icon, title, text, onClick }: { icon: any; title: string; t
 function Empty({ title, text }: { title: string; text: string }) { return <div className="empty"><b>{title}</b><p>{text}</p></div> }
 function Status({ s }: { s: string }) { return <span className={'status ' + s.toLowerCase().replaceAll(' ', '-')}>{s}</span> }
 
-function Pipeline({ companies, stages, onOpen, onUpdate, onOutreachChange, onRenameStage, onAddStage }: { companies: any[]; stages: any[]; onOpen: any; onUpdate: any; onOutreachChange: any; onRenameStage: any; onAddStage: any }) {
+function Pipeline({ companies, stages, onOpen, onUpdate, onOutreachChange, onRenameStage, onAddStage, onDeleteStage, onMoveStage }: { companies: any[]; stages: any[]; onOpen: any; onUpdate: any; onOutreachChange: any; onRenameStage: any; onAddStage: any; onDeleteStage: any; onMoveStage: any }) {
   const [dragId, setDragId] = useState<string | null>(null)
   return (
     <>
@@ -714,7 +915,10 @@ function Pipeline({ companies, stages, onOpen, onUpdate, onOutreachChange, onRen
             <div className="col-head">
               <b>{stage}</b>
               <span className="col-tools">
+                <button className="col-edit" title="Move left" onClick={() => onMoveStage(s, -1)}>‹</button>
+                <button className="col-edit" title="Move right" onClick={() => onMoveStage(s, 1)}>›</button>
                 <button className="col-edit" title="Rename stage" onClick={() => onRenameStage(s)}><Pencil /></button>
+                <button className="col-edit" title="Delete stage" onClick={() => onDeleteStage(s)}><Trash2 /></button>
                 {companies.filter(c => c.lead_status === stage).length}
               </span>
             </div>
@@ -784,14 +988,14 @@ function Companies({ companies, onOpen, onNew, onOutreachChange }: { companies: 
   )
 }
 
-function Detail({ c, stages, onBack, onUpdate, onEdit, onDelete, onAddActivity, onScheduleMeeting, onSaveNotes, deleting, onOutreachChange, onProjectStageChange, onRetainerTierChange, onAddMilestone, onToggleMilestone, onApplyTemplate, onUpdateMilestoneProgress, onDeleteMilestone }: { c: any; stages: string[]; onBack: any; onUpdate: any; onEdit: any; onDelete: any; onAddActivity: any; onScheduleMeeting: any; onSaveNotes: any; deleting?: boolean; onOutreachChange: any; onProjectStageChange: any; onRetainerTierChange: any; onAddMilestone: any; onToggleMilestone: any; onApplyTemplate: any; onUpdateMilestoneProgress: any; onDeleteMilestone: any }) {
+function Detail({ c, stages, onBack, backLabel, onUpdate, onEdit, onDelete, onAddActivity, onScheduleMeeting, onSaveNotes, deleting, onOutreachChange, onProjectStageChange, onRetainerTierChange, onAddMilestone, onToggleMilestone, onApplyTemplate, onUpdateMilestoneProgress, onDeleteMilestone }: { c: any; stages: string[]; onBack: any; backLabel: string; onUpdate: any; onEdit: any; onDelete: any; onAddActivity: any; onScheduleMeeting: any; onSaveNotes: any; deleting?: boolean; onOutreachChange: any; onProjectStageChange: any; onRetainerTierChange: any; onAddMilestone: any; onToggleMilestone: any; onApplyTemplate: any; onUpdateMilestoneProgress: any; onDeleteMilestone: any }) {
   const [tab, setTab] = useState('overview')
   const [notes, setNotes] = useState(c.remarks || '')
   useEffect(() => { setNotes(c.remarks || '') }, [c.id])
   const idx = stages.indexOf(c.lead_status)
   return (
     <>
-      <button className="back" onClick={onBack}>← Companies</button>
+      <button className="back" onClick={onBack}>← {backLabel}</button>
       <div className="detail-head">
         <div className="logo-dot xl">{initials(c.name)}</div>
         <div><div className="eyebrow">COMPANY</div><h1>{c.name}</h1><p>{c.website || 'No website'} · {c.address || 'No address'}</p></div>
@@ -881,12 +1085,8 @@ function ProjectPanel({ c, onStageChange, onTierChange, onAddMilestone, onToggle
     onAddMilestone(c, { title: title.trim(), cadence, category, priority, target_date: targetDate ? new Date(targetDate).toISOString() : undefined })
     setTitle(''); setTargetDate('')
   }
-  const columns: { key: string; label: string }[] = [
-    { key: 'pending', label: 'Not started' },
-    { key: 'in_progress', label: 'In progress' },
-    { key: 'done', label: 'Done' },
-  ]
-  const bucketOf = (m: any) => (m.status === 'in_progress' ? 'in_progress' : m.status === 'done' ? 'done' : 'pending')
+  const columns = milestoneStatuses
+  const bucketOf = bucketOfMilestone
   return (
     <>
       <div className="detail-grid">
@@ -961,9 +1161,10 @@ function ProjectPanel({ c, onStageChange, onTierChange, onAddMilestone, onToggle
                         {m.target_date && <span className="chip">{new Date(m.target_date).toLocaleDateString()}</span>}
                         {isOverdue(m) && <span className="chip overdue">{m.status === 'missed' ? 'Missed' : 'Overdue'}</span>}
                       </div>
+                      <MilestoneStatusSelect milestone={m} onChange={st => onToggleMilestone(c.id, m.id, st)} />
                       <div className="progress-track"><div className="progress-fill" style={{ width: `${m.progress ?? 0}%` }} /></div>
                       <div className="progress-row">
-                        <input type="number" min={0} max={100} value={m.progress ?? 0} onChange={e => onUpdateProgress(c.id, m.id, Math.max(0, Math.min(100, +e.target.value || 0)))} />
+                        <ProgressInput value={m.progress ?? 0} onCommit={v => onUpdateProgress(c.id, m.id, v)} />
                         <span>% complete</span>
                       </div>
                     </div>
@@ -979,7 +1180,7 @@ function ProjectPanel({ c, onStageChange, onTierChange, onAddMilestone, onToggle
   )
 }
 
-function CalendarView({ meetings, googleConn, onSync, onDeleteMeeting }: { meetings: any[]; googleConn: any; onSync: (manual?: boolean) => void | Promise<void>; onDeleteMeeting: any }) {
+function CalendarView({ meetings, companies, googleConn, onSync, onDeleteMeeting, onLinkMeeting }: { meetings: any[]; companies: any[]; googleConn: any; onSync: (manual?: boolean) => void | Promise<void>; onDeleteMeeting: any; onLinkMeeting: any }) {
   const [weekStart, setWeekStart] = useState<Date>(() => startOfWeek(new Date(), { weekStartsOn: 1 }))
   const [syncing, setSyncing] = useState(false)
   const days = [0, 1, 2, 3, 4, 5, 6].map(i => addDays(weekStart, i))
@@ -1033,6 +1234,7 @@ function CalendarView({ meetings, googleConn, onSync, onDeleteMeeting }: { meeti
                   <div className="cal-event" key={m.id}>
                     <button className="cal-event-delete" onClick={() => onDeleteMeeting(m)} title="Delete meeting"><X /></button>
                     <strong>{m.companies?.name || m.title}</strong><small>{m.title}{m.google_meet_url ? ' · Meet' : ''}</small>
+                    {!m.company_id && <MeetingCompanyPicker meeting={m} companies={companies} onLink={onLinkMeeting} compact />}
                   </div>
                 ))}
               </div>
@@ -1096,7 +1298,7 @@ function ProjectsView({ companies, onToggleMilestone, onUpdateProgress, onUpdate
   const [priorityFilter, setPriorityFilter] = useState('all')
   const [companyFilter, setCompanyFilter] = useState('all')
   const [drag, setDrag] = useState<{ id: string; companyId: string } | null>(null)
-  const bucketOf = (m: any) => (m.status === 'in_progress' ? 'in_progress' : m.status === 'done' ? 'done' : 'pending')
+  const bucketOf = bucketOfMilestone
   const all = companies.flatMap((c: any) => (c.milestones || []).map((m: any) => ({ ...m, companyName: c.name, companyId: c.id })))
   const withTasks = companies.filter((c: any) => (c.milestones || []).length)
   const filtered = all.filter((m: any) =>
@@ -1104,11 +1306,7 @@ function ProjectsView({ companies, onToggleMilestone, onUpdateProgress, onUpdate
     (statusFilter === 'all' || bucketOf(m) === statusFilter) &&
     (companyFilter === 'all' || m.companyId === companyFilter)
   )
-  const columns: { key: string; label: string }[] = [
-    { key: 'pending', label: 'Not started' },
-    { key: 'in_progress', label: 'In progress' },
-    { key: 'done', label: 'Done' },
-  ]
+  const columns = milestoneStatuses
   function openCompany(companyId: string) {
     const full = companies.find((c: any) => c.id === companyId)
     if (full) onOpenCompany(full)
@@ -1132,9 +1330,7 @@ function ProjectsView({ companies, onToggleMilestone, onUpdateProgress, onUpdate
           </select>
           <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)}>
             <option value="all">All statuses</option>
-            <option value="pending">Not started</option>
-            <option value="in_progress">In progress</option>
-            <option value="done">Done</option>
+            {milestoneStatuses.map(st => <option key={st.key} value={st.key}>{st.label}</option>)}
           </select>
           <select value={priorityFilter} onChange={e => setPriorityFilter(e.target.value)}>
             <option value="all">All priorities</option>
@@ -1197,9 +1393,10 @@ function ProjectsView({ companies, onToggleMilestone, onUpdateProgress, onUpdate
                       {m.target_date && <span className="chip">{new Date(m.target_date).toLocaleDateString()}</span>}
                       {isOverdue(m) && <span className="chip overdue">{m.status === 'missed' ? 'Missed' : 'Overdue'}</span>}
                     </div>
+                    <MilestoneStatusSelect milestone={m} onChange={st => onToggleMilestone(m.companyId, m.id, st)} />
                     <div className="progress-track"><div className="progress-fill" style={{ width: `${m.progress ?? 0}%` }} /></div>
                     <div className="progress-row">
-                      <input type="number" min={0} max={100} value={m.progress ?? 0} onChange={e => onUpdateProgress(m.companyId, m.id, Math.max(0, Math.min(100, +e.target.value || 0)))} />
+                      <ProgressInput value={m.progress ?? 0} onCommit={v => onUpdateProgress(m.companyId, m.id, v)} />
                       <span>% complete</span>
                     </div>
                   </div>
@@ -1246,7 +1443,7 @@ function ProjectsView({ companies, onToggleMilestone, onUpdateProgress, onUpdate
                     </td>
                     <td>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                        <input type="number" min={0} max={100} value={m.progress ?? 0} onChange={e => onUpdateProgress(m.companyId, m.id, Math.max(0, Math.min(100, +e.target.value || 0)))} />
+                        <ProgressInput value={m.progress ?? 0} onCommit={v => onUpdateProgress(m.companyId, m.id, v)} />
                         <div className="progress-track" style={{ width: 64 }}><div className="progress-fill" style={{ width: `${m.progress ?? 0}%` }} /></div>
                       </div>
                     </td>
@@ -1279,7 +1476,7 @@ function ProjectsView({ companies, onToggleMilestone, onUpdateProgress, onUpdate
   )
 }
 
-function SettingsView({ googleConn }: { googleConn: any }) {
+function SettingsView({ googleConn, profile, user }: { googleConn: any; profile: any; user: any }) {
   return (
     <>
       <div className="page-title"><div><div className="eyebrow">SETTINGS</div><h1>VESPER.</h1><p>Workspace settings and integrations.</p></div></div>
@@ -1291,7 +1488,18 @@ function SettingsView({ googleConn }: { googleConn: any }) {
             ? <span className="status active">Connected · {googleConn.connected_email || 'Google'}</span>
             : <a className="primary link" href="/api/calendar/auth">Connect Google Calendar</a>}
         </div>
-        <div className="panel"><h2>Workspace</h2><p>Two-user outreach workspace. Roles are stored in your VESPER profiles.</p><span className="status active">Active</span></div>
+        <div className="panel">
+          <h2>Workspace</h2>
+          <p>Shared two-person outreach workspace. Everyone approved sees every company.</p>
+          <Info label="Signed in as" value={profile?.display_name || profile?.username || user?.email} />
+          <Info label="Role" value={profile ? profile.role : '—'} />
+          <Info label="Access" value={profile ? (profile.approved ? 'Approved' : 'Pending approval') : '—'} />
+          <p style={{ marginTop: 12, fontSize: 11 }}>
+            Roles are recorded but not yet enforced — admin and member currently have identical
+            permissions. Access is what the database actually checks: an unapproved account can
+            sign in but reads nothing. Approve one from the Supabase table editor.
+          </p>
+        </div>
       </div>
     </>
   )
@@ -1359,7 +1567,9 @@ function AddActivity({ company, onClose, onSave }: { company: any; onClose: () =
 }
 
 function NewMeetingForm({ company, onClose, onSave }: { company: any; onClose: () => void; onSave: (m: any) => void }) {
+  const [type, setType] = useState('Discovery Call')
   const [title, setTitle] = useState(`Discovery Call — ${company.name}`)
+  const [titleTouched, setTitleTouched] = useState(false)
   const [date, setDate] = useState('')
   const [start, setStart] = useState('11:30')
   const [duration, setDuration] = useState(30)
@@ -1370,7 +1580,7 @@ function NewMeetingForm({ company, onClose, onSave }: { company: any; onClose: (
     const starts_at = new Date(`${date}T${start}:00`)
     const ends_at = new Date(starts_at.getTime() + duration * 60000)
     setSaving(true)
-    await onSave({ title, starts_at: starts_at.toISOString(), ends_at: ends_at.toISOString(), location })
+    await onSave({ title, meeting_type: type, starts_at: starts_at.toISOString(), ends_at: ends_at.toISOString(), location })
     setSaving(false)
   }
   return (
@@ -1378,7 +1588,20 @@ function NewMeetingForm({ company, onClose, onSave }: { company: any; onClose: (
       <div className="modal" style={{ width: 'min(500px,96vw)' }}>
         <div className="modal-head"><div><div className="eyebrow">NEW MEETING</div><h2>{company.name}</h2></div><button onClick={onClose} disabled={saving}><X /></button></div>
         <div className="form-grid" style={{ gridTemplateColumns: '1fr 1fr' }}>
-          <label style={{ gridColumn: '1 / -1' }}>Title<input value={title} onChange={e => setTitle(e.target.value)} disabled={saving} /></label>
+          <label style={{ gridColumn: '1 / -1' }}>Type
+            <select
+              value={type}
+              disabled={saving}
+              onChange={e => {
+                setType(e.target.value)
+                // Keep the title in step until the user writes their own, then leave it alone.
+                if (!titleTouched) setTitle(`${e.target.value} — ${company.name}`)
+              }}
+            >
+              {meetingTypes.map(t => <option key={t} value={t}>{t}</option>)}
+            </select>
+          </label>
+          <label style={{ gridColumn: '1 / -1' }}>Title<input value={title} onChange={e => { setTitle(e.target.value); setTitleTouched(true) }} disabled={saving} /></label>
           <label>Date<input type="date" value={date} onChange={e => setDate(e.target.value)} disabled={saving} /></label>
           <label>Start time<input type="time" value={start} onChange={e => setStart(e.target.value)} disabled={saving} /></label>
           <label>Duration (min)<input type="number" value={duration} onChange={e => setDuration(+e.target.value)} disabled={saving} /></label>

@@ -1,10 +1,23 @@
+-- VESPER CRM canonical schema. Runs clean on an empty database AND is safe to re-run over
+-- an existing one: tables/columns are `if not exists`, constraints and policies are dropped
+-- by name first, and functions/triggers use `create or replace`.
 create extension if not exists pgcrypto;
+
+-- Defined up here, not next to the companies/contacts/meetings triggers further down:
+-- the milestones trigger references it ~30 lines earlier than that, and Postgres resolves
+-- the function at CREATE TRIGGER time. With the old ordering a fresh database aborted on
+-- `function set_updated_at() does not exist`, so this file had never actually run clean.
+create or replace function set_updated_at() returns trigger language plpgsql as $$ begin new.updated_at = now(); return new; end $$;
 
 create table if not exists profiles (
  id uuid primary key references auth.users(id) on delete cascade,
  username text unique,
  display_name text,
  role text not null default 'member' check (role in ('admin','member')),
+ -- Gate for RLS: having an auth account is not the same as being VESPER staff. Self-signup
+ -- means anyone can get an account, so every data policy below checks this instead of merely
+ -- checking `to authenticated`. New signups land here as false and can read nothing.
+ approved boolean not null default false,
  created_at timestamptz not null default now()
 );
 
@@ -153,8 +166,19 @@ create table if not exists milestones (
  created_at timestamptz not null default now(),
  updated_at timestamptz not null default now()
 );
+-- Reads the approval gate WITHOUT recursing: a policy on `profiles` that selects from
+-- `profiles` fails with 42P17 (infinite recursion). SECURITY DEFINER runs this one lookup as
+-- the function owner, which skips RLS for it and breaks the cycle.
+create or replace function public.is_approved() returns boolean
+  language sql stable security definer set search_path = public as $$
+  select exists (select 1 from profiles where id = auth.uid() and approved)
+$$;
+revoke all on function public.is_approved() from public;
+grant execute on function public.is_approved() to authenticated;
+
 alter table milestones enable row level security;
-create policy "authenticated milestones" on milestones for all to authenticated using (true) with check (true);
+drop policy if exists "approved milestones" on milestones;
+create policy "approved milestones" on milestones for all to authenticated using (public.is_approved()) with check (public.is_approved());
 create or replace trigger milestones_updated before update on milestones for each row execute function set_updated_at();
 
 alter table profiles enable row level security;
@@ -167,22 +191,37 @@ alter table meetings enable row level security;
 alter table calendar_connections enable row level security;
 alter table audit_log enable row level security;
 
-create policy "authenticated profiles" on profiles for select to authenticated using (true);
-create policy "authenticated companies" on companies for all to authenticated using (true) with check (true);
-create policy "authenticated contacts" on contacts for all to authenticated using (true) with check (true);
-create policy "authenticated opportunities" on opportunities for all to authenticated using (true) with check (true);
-create policy "authenticated activities" on activities for all to authenticated using (true) with check (true);
-create policy "authenticated tasks" on tasks for all to authenticated using (true) with check (true);
-create policy "authenticated meetings" on meetings for all to authenticated using (true) with check (true);
+drop policy if exists "own or approved profiles" on profiles;
+create policy "own or approved profiles" on profiles for select to authenticated using (id = auth.uid() or public.is_approved());
+drop policy if exists "approved companies" on companies;
+create policy "approved companies" on companies for all to authenticated using (public.is_approved()) with check (public.is_approved());
+drop policy if exists "approved contacts" on contacts;
+create policy "approved contacts" on contacts for all to authenticated using (public.is_approved()) with check (public.is_approved());
+drop policy if exists "approved opportunities" on opportunities;
+create policy "approved opportunities" on opportunities for all to authenticated using (public.is_approved()) with check (public.is_approved());
+drop policy if exists "approved activities" on activities;
+create policy "approved activities" on activities for all to authenticated using (public.is_approved()) with check (public.is_approved());
+drop policy if exists "approved tasks" on tasks;
+create policy "approved tasks" on tasks for all to authenticated using (public.is_approved()) with check (public.is_approved());
+drop policy if exists "approved meetings" on meetings;
+create policy "approved meetings" on meetings for all to authenticated using (public.is_approved()) with check (public.is_approved());
+drop policy if exists "own calendar connection" on calendar_connections;
 create policy "own calendar connection" on calendar_connections for all to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid());
-create policy "authenticated audit" on audit_log for all to authenticated using (true) with check (true);
+drop policy if exists "authenticated audit" on audit_log;
+drop policy if exists "approved audit" on audit_log;
+-- Append-only on purpose. An audit trail that the audited party can edit or delete is not an
+-- audit trail — the old `for all using (true)` let any user erase their own history. No update
+-- or delete policy exists, so those are denied outright; corrections go in as new rows.
+create policy "approved audit read" on audit_log for select to authenticated using (public.is_approved());
+create policy "approved audit append" on audit_log for insert to authenticated with check (public.is_approved());
 
-insert into profiles (id, username, display_name, role)
-select id, coalesce(raw_user_meta_data->>'username', split_part(email,'@',1)), coalesce(raw_user_meta_data->>'display_name', split_part(email,'@',1)), 'admin'
+-- Accounts that already existed when this ran are the founding staff: admin + approved.
+-- Everyone who signs up after this gets 'member'/approved=false via handle_new_user().
+insert into profiles (id, username, display_name, role, approved)
+select id, coalesce(raw_user_meta_data->>'username', split_part(email,'@',1)), coalesce(raw_user_meta_data->>'display_name', split_part(email,'@',1)), 'admin', true
 from auth.users
 on conflict (id) do nothing;
 
-create or replace function set_updated_at() returns trigger language plpgsql as $$ begin new.updated_at = now(); return new; end $$;
 create or replace trigger companies_updated before update on companies for each row execute function set_updated_at();
 create or replace trigger contacts_updated before update on contacts for each row execute function set_updated_at();
 create or replace trigger opp_updated before update on opportunities for each row execute function set_updated_at();
@@ -197,12 +236,21 @@ drop trigger if exists on_auth_user_created on auth.users;
 create trigger on_auth_user_created after insert on auth.users for each row execute procedure public.handle_new_user();
 
 -- 2026-09-07: upgrade milestones into a full project-task board (priority, progress, in-progress status)
--- 2026-09-08: currently unused / reserved — nothing in the UI reads or writes these yet:
---   companies.deal_value_min / deal_value_max / deal_value_type  (deal value ranges)
---   opportunities  (multi-deal-per-company model)
---   audit_log      (change history)
---   meetings.meeting_type is written by default only; meetings.status is settable but has no UI
--- Kept so no data is dropped; wire them up or drop them deliberately later.
+-- 2026-09-16: dead-schema status, re-verified against the code rather than assumed.
+--   Still unread and unwritten by every .ts/.tsx file:
+--     companies.deal_value_min / deal_value_max / deal_value_type  (deal value ranges)
+--     companies.facebook, contacts.facebook, contacts.address
+--     opportunities, and the opportunity_id columns on activities / tasks / meetings
+--   → supabase/migrate-drop-unused.sql removes these. It is destructive and opt-in, and it
+--     audits for real data before it will let you drop anything.
+--
+--   No longer dead:
+--     meetings.meeting_type  — the new-meeting form sets it (it used to take the default, so
+--                              every meeting on Today claimed to be a Discovery Call)
+--     profiles.role          — read and shown in Settings; recorded, not yet enforced
+--   Kept on purpose:
+--     audit_log              — still unwritten, but now append-only (see migrate-security.sql)
+--     meetings.status        — set on insert and deliberately preserved across calendar re-sync
 
 alter table milestones add column if not exists priority text not null default 'Medium' check (priority in ('Low','Medium','High'));
 alter table milestones add column if not exists progress smallint not null default 0 check (progress >= 0 and progress <= 100);
@@ -220,7 +268,8 @@ create table if not exists pipeline_stages (
 );
 alter table pipeline_stages enable row level security;
 drop policy if exists "authenticated pipeline_stages" on pipeline_stages;
-create policy "authenticated pipeline_stages" on pipeline_stages for all to authenticated using (true) with check (true);
+drop policy if exists "approved pipeline_stages" on pipeline_stages;
+create policy "approved pipeline_stages" on pipeline_stages for all to authenticated using (public.is_approved()) with check (public.is_approved());
 insert into pipeline_stages (name, kind, position) values
  ('Prospect','open',1),('Qualified Lead','open',2),('Discovery Call','open',3),
  ('Proposal Agreement Sent','open',4),('Close Call','open',5),('Verbal Approval','open',6),

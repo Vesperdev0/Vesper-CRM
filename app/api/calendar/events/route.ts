@@ -24,7 +24,10 @@ export async function POST(req: NextRequest) {
       conferenceData: { createRequest: { requestId: crypto.randomUUID(), conferenceSolutionKey: { type: 'hangoutsMeet' } } },
     },
   })
-  return NextResponse.json({ event: event.data })
+  // Return which calendar this actually landed on. The client used to hardcode 'primary' on the
+  // meetings row it then inserted, which was wrong whenever the connection pointed at a
+  // different calendar — the stored row disagreed with where the event really lived.
+  return NextResponse.json({ event: event.data, calendarId: conn.calendar_id || 'primary' })
 }
 
 export async function DELETE(req: NextRequest) {
