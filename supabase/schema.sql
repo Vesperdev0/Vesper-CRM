@@ -329,10 +329,17 @@ create unique index if not exists retainers_one_live_per_company
 create index if not exists retainers_company_idx on retainers (company_id);
 create index if not exists retainers_status_idx on retainers (status);
 
+-- Backfill BEFORE the constraint below, not after. A database that ran the earlier version of
+-- this file can already hold an active row with a null next_invoice_due, and the tightened
+-- constraint would be rejected outright on that row before any later statement could fix it.
+-- Idempotent: only touches active rows that are missing the field.
+update retainers set next_invoice_due = (billing_anchor + interval '1 month')::date
+where status = 'active' and next_invoice_due is null and billing_anchor is not null;
+
 -- Invariants stated in the spec, enforced here rather than trusted to the UI.
 alter table retainers drop constraint if exists retainers_active_dates_check;
 alter table retainers add constraint retainers_active_dates_check
- check (status <> 'active' or (started_at is not null and billing_anchor is not null));
+ check (status <> 'active' or (started_at is not null and billing_anchor is not null and next_invoice_due is not null));
 alter table retainers drop constraint if exists retainers_churned_date_check;
 alter table retainers add constraint retainers_churned_date_check
  check (status <> 'churned' or churned_at is not null);
@@ -364,10 +371,6 @@ drop trigger if exists retainers_activate on retainers;
 create trigger retainers_activate before insert or update on retainers
  for each row execute function public.retainer_activate_on_first_invoice();
 
--- Backfill for rows activated before next_invoice_due was derived. Idempotent: only touches
--- active rows that are missing it.
-update retainers set next_invoice_due = (billing_anchor + interval '1 month')::date
-where status = 'active' and next_invoice_due is null and billing_anchor is not null;
 
 drop trigger if exists retainers_updated on retainers;
 create trigger retainers_updated before update on retainers
