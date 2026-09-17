@@ -1253,6 +1253,10 @@ function ProjectPanel({ c, retainer, onConvertRetainer, onRecordFirstInvoice, on
   const [targetDate, setTargetDate] = useState('')
   const [dragId, setDragId] = useState<string | null>(null)
   const milestones = c.milestones || []
+  // A live retainer's tier wins over the legacy column. goalTemplateFor() normalises the case,
+  // so 'Growth' from retainers.tier and 'growth' from companies.retainer_tier both resolve.
+  const effectiveTier = retainer?.tier || c.retainer_tier || null
+  const templateGoals = goalTemplateFor(effectiveTier)
   function submit(e: React.FormEvent) {
     e.preventDefault()
     if (!title.trim()) return
@@ -1282,21 +1286,31 @@ function ProjectPanel({ c, retainer, onConvertRetainer, onRecordFirstInvoice, on
             onRecordFirstInvoice={onRecordFirstInvoice}
           />
 
-          {/* Legacy companies.retainer_tier control, left in place deliberately — this column is
-              being retired under the drop-unused workstream and was explicitly out of scope here.
-              It drives the standard-goals template below and nothing else. */}
+          {/* Exactly one tier control is ever on screen. Once a live retainer exists it IS the
+              tier, so the legacy companies.retainer_tier select is hidden and the standard goals
+              derive from retainers.tier — leaving both visible would be two sources of truth for
+              the same fact, free to drift, with nothing to reconcile them. Before conversion
+              there is no retainer to conflict with, so the legacy select stays and keeps driving
+              the template on its own. The column itself is untouched either way; it is retired
+              under the drop-unused workstream, not here. */}
           <div className="panel-head" style={{ marginTop: 22 }}><h2>Retainer goal template</h2></div>
-          <div className="form-grid" style={{ gridTemplateColumns: '1fr', padding: 0 }}>
-            <label>Tier
-              <select value={c.retainer_tier || ''} onChange={e => onTierChange(c.id, e.target.value)}>
-                <option value="">— none —</option>
-                {retainerTiers.map(t => <option key={t} value={t}>{t}</option>)}
-              </select>
-            </label>
-          </div>
-          {c.retainer_tier && goalTemplateFor(c.retainer_tier).length > 0 && (
-            <button className="text-btn" style={{ marginTop: 12 }} onClick={() => onApplyTemplate(c, c.retainer_tier)}>
-              <Plus /> Add {c.retainer_tier}'s standard goals
+          {retainer ? (
+            <p style={{ fontSize: 11, color: 'var(--muted)', margin: '0 0 10px' }}>
+              Following the <b>{retainer.tier}</b> retainer above.
+            </p>
+          ) : (
+            <div className="form-grid" style={{ gridTemplateColumns: '1fr', padding: 0 }}>
+              <label>Tier
+                <select value={c.retainer_tier || ''} onChange={e => onTierChange(c.id, e.target.value)}>
+                  <option value="">— none —</option>
+                  {retainerTiers.map(t => <option key={t} value={t}>{t}</option>)}
+                </select>
+              </label>
+            </div>
+          )}
+          {templateGoals.length > 0 && (
+            <button className="text-btn" style={{ marginTop: 12 }} onClick={() => onApplyTemplate(c, effectiveTier)}>
+              <Plus /> Add {effectiveTier}'s standard goals
             </button>
           )}
         </section>
