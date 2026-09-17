@@ -4,7 +4,7 @@ import { supabase } from '../lib/supabase'
 import {
   Calendar, ChevronRight, Command, Home, Kanban, LayoutGrid, LogOut, Menu, Plus, Search,
   Settings, Users, CheckCircle2, Clock3, Phone, Mail, MessageCircle, Globe, MapPin, Sun, Moon,
-  X, ArrowUpRight, Trash2, Pencil, Save
+  X, ArrowUpRight, Trash2, Pencil, Save, Repeat
 } from 'lucide-react'
 import { startOfWeek, addDays, addWeeks, format, isSameDay } from 'date-fns'
 
@@ -123,6 +123,15 @@ function initials(n: string) {
   // undefined x[0] and crash on .toUpperCase().
   return n.trim().split(/\s+/).filter(Boolean).map(x => x[0]).slice(0, 2).join('').toUpperCase() || '?'
 }
+// Today as a local YYYY-MM-DD calendar date. Deliberately NOT toISOString().slice(0,10), which
+// converts to UTC first — before 05:30 IST that hands back yesterday, and churn would be dated a
+// day early. Same reason the retainer date fields are passed around as raw strings.
+function todayISO() {
+  const d = new Date()
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+}
+
 function fmtDate(d: string | null | undefined) {
   if (!d) return '—'
   return new Date(d).toLocaleDateString('en-IN', { month: 'short', day: 'numeric' })
@@ -183,6 +192,7 @@ export default function Page() {
   const [profile, setProfile] = useState<any>(null)
   const [liveRetainers, setLiveRetainers] = useState<any[]>([])
   const [convertTarget, setConvertTarget] = useState<any>(null)
+  const [churnedRetainers, setChurnedRetainers] = useState<any[]>([])
   const [view, setView] = useState('home')
   const [selected, setSelected] = useState<any>(null)
   // Where opening this company came from, so the detail page's back button returns there
@@ -235,8 +245,17 @@ export default function Page() {
   async function loadRetainers() {
     const { data, error } = await supabase.from('current_retainers').select('*')
     // Table/view missing (migration not applied) → no retainers, and the UI just won't offer it.
-    if (error) { setLiveRetainers([]); return }
-    setLiveRetainers(data || [])
+    if (error) { setLiveRetainers([]) } else { setLiveRetainers(data || []) }
+
+    // Churned engagements are terminal history and are read SEPARATELY, from the table with an
+    // explicit status filter. current_retainers cannot supply them — excluding them is the whole
+    // point of the view. Keeping them in their own piece of state is what makes it structurally
+    // impossible for a churned row to reach a live count or the MRR total: the summary reads
+    // liveRetainers and never sees this array at all.
+    const { data: churned, error: cErr } = await supabase
+      .from('retainers').select('*').eq('status', 'churned').order('churned_at', { ascending: false })
+    if (cErr) { setChurnedRetainers([]); return }
+    setChurnedRetainers(churned || [])
   }
   const retainerFor = (companyId: string) => liveRetainers.find(r => r.company_id === companyId) || null
 
@@ -381,7 +400,7 @@ export default function Page() {
   }
   async function logout() {
     await supabase.auth.signOut()
-    setUser(null); setCompanies([]); setTasks([]); setMeetings([]); setProfile(null); setLiveRetainers([]); setSelected(null); setAiQuery(null); setView('home')
+    setUser(null); setCompanies([]); setTasks([]); setMeetings([]); setProfile(null); setLiveRetainers([]); setChurnedRetainers([]); setSelected(null); setAiQuery(null); setView('home')
   }
 
   async function addCompany(c: any) {
@@ -561,6 +580,52 @@ export default function Page() {
       title: `First retainer invoice issued — billing anchored to ${fmtDate(data.billing_anchor)}, next due ${fmtDate(data.next_invoice_due)}`,
     })
     await refetchCompany(retainer.company_id, selected?.id === retainer.company_id)
+  }
+
+  // One write path for every retainer status/tier change, so each of them reloads the view and
+  // leaves a timeline entry on the company rather than mutating quietly.
+  async function updateRetainer(retainer: any, patch: any, activityTitle: string) {
+    const { data, error } = await supabase.from('retainers').update(patch).eq('id', retainer.id).select().single()
+    if (error) { alert(error.message); return null }
+    await loadRetainers()
+    const { data: auth } = await supabase.auth.getUser()
+    await supabase.from('activities').insert({
+      company_id: retainer.company_id, user_id: auth.user?.id, type: 'system', title: activityTitle,
+    })
+    await refetchCompany(retainer.company_id, selected?.id === retainer.company_id)
+    return data
+  }
+
+  async function changeRetainerTier(retainer: any, tier: string) {
+    if (!tier || tier === retainer.tier) return
+    const patch: any = { tier }
+    // monthly_amount is the number actually agreed for this engagement, never derived from tier,
+    // so moving tier does not silently reprice it. Offer the new default, don't assume it.
+    const def = retainerTierDefaults[tier]
+    if (def != null && Number(retainer.monthly_amount) !== def &&
+        confirm(`Change tier to ${tier}.\n\nAlso set the monthly amount to the ${tier} default of ${money(def)}?\nCancel keeps the agreed ${money(retainer.monthly_amount)}.`)) {
+      patch.monthly_amount = def
+    }
+    await updateRetainer(retainer, patch, `Retainer tier changed to ${tier}`)
+  }
+
+  async function pauseRetainer(r: any) {
+    if (!confirm(`Pause the ${r.tier} retainer?\n\nIt stops counting toward live totals and can be resumed at any time.`)) return
+    await updateRetainer(r, { status: 'paused' }, 'Retainer paused')
+  }
+
+  async function resumeRetainer(r: any) {
+    // Back to whichever state it genuinely was in. A retainer paused before its first invoice
+    // returns to pending, not active — 'active' requires the billing dates the DB constraint
+    // enforces, and it has none yet.
+    const next = r.first_invoice_issued_on ? 'active' : 'pending'
+    await updateRetainer(r, { status: next },
+      next === 'active' ? 'Retainer resumed' : 'Retainer resumed — still awaiting first invoice')
+  }
+
+  async function churnRetainer(r: any) {
+    if (!confirm(`Churn the ${r.tier} retainer?\n\nThe record is kept, never deleted — it moves to Churned and drops out of live totals. If they re-sign later that starts a new retainer, leaving this one intact as history.`)) return
+    await updateRetainer(r, { status: 'churned', churned_at: todayISO() }, 'Retainer churned')
   }
 
   function patchMilestonesLocally(companyId: string, fn: (ms: any[]) => any[]) {
@@ -772,6 +837,7 @@ export default function Page() {
           <Nav active={view === 'pipeline'} icon={<Kanban />} label="Sales" onClick={() => setView('pipeline')} />
           <Nav active={view === 'companies'} icon={<Users />} label="Companies" onClick={() => setView('companies')} />
           <Nav active={view === 'projects'} icon={<LayoutGrid />} label="Projects" onClick={() => setView('projects')} />
+          <Nav active={view === 'retainer'} icon={<Repeat />} label="Retainer" onClick={() => setView('retainer')} />
           <Nav active={view === 'calendar'} icon={<Calendar />} label="Calendar" onClick={() => setView('calendar')} />
           <Nav active={view === 'tasks'} icon={<CheckCircle2 />} label="Tasks" onClick={() => setView('tasks')} />
         </nav>
@@ -796,6 +862,20 @@ export default function Page() {
           {view === 'pipeline' && <Pipeline companies={filtered.filter((c: any) => !c.project_stage)} stages={stageRows} onOpen={(c: any) => { openCompany(c, 'pipeline') }} onUpdate={handleStageChange} onOutreachChange={updateOutreachStatus} onRenameStage={renameStage} onAddStage={addStage} onDeleteStage={deleteStage} onMoveStage={moveStage} />}
           {view === 'companies' && <Companies companies={aiResult?.matches ?? filtered} onOpen={(c: any) => { openCompany(c, 'companies') }} onNew={() => setShowNew(true)} onOutreachChange={updateOutreachStatus} />}
           {view === 'projects' && <ProjectsView companies={filtered} onToggleMilestone={toggleMilestone} onUpdateProgress={updateMilestoneProgress} onUpdateFields={updateMilestoneFields} onDeleteMilestone={deleteMilestone} onProjectStageChange={updateProjectStage} onOpenCompany={(c: any) => { openCompany(c, 'projects') }} />}
+          {view === 'retainer' && (
+            <RetainerView
+              live={liveRetainers}
+              churned={churnedRetainers}
+              companies={filtered}
+              allCompanies={companies}
+              onChangeTier={changeRetainerTier}
+              onPause={pauseRetainer}
+              onResume={resumeRetainer}
+              onChurn={churnRetainer}
+              onRecordFirstInvoice={recordFirstInvoice}
+              onOpenCompany={(id: string) => { const c = companies.find(z => z.id === id); if (c) openCompany(c, 'retainer') }}
+            />
+          )}
           {view === 'calendar' && <CalendarView meetings={meetings} companies={companies} googleConn={googleConn} onSync={syncGoogleCalendar} onDeleteMeeting={deleteMeeting} onLinkMeeting={linkMeetingToCompany} />}
           {view === 'tasks' && <Tasks tasks={tasks} companies={companies} onToggle={toggleTask} onAdd={addTask} onDelete={deleteTask} />}
           {view === 'settings' && <SettingsView googleConn={googleConn} profile={profile} user={user} />}
@@ -804,7 +884,7 @@ export default function Page() {
               c={selected}
               stages={stageNames}
               onBack={() => setView(cameFrom)}
-              backLabel={cameFrom === 'home' ? 'Today' : cameFrom === 'pipeline' ? 'Sales' : cameFrom === 'projects' ? 'Projects' : 'Companies'}
+              backLabel={cameFrom === 'home' ? 'Today' : cameFrom === 'pipeline' ? 'Sales' : cameFrom === 'projects' ? 'Projects' : cameFrom === 'retainer' ? 'Retainer' : 'Companies'}
               onUpdate={handleStageChange}
               onEdit={(c: any) => setEditCompany(c)}
               onDelete={deleteCompany}
@@ -832,6 +912,7 @@ export default function Page() {
         <Nav active={view === 'pipeline'} icon={<Kanban />} label="Sales" onClick={() => setView('pipeline')} />
         <Nav active={view === 'companies'} icon={<Users />} label="Companies" onClick={() => setView('companies')} />
         <Nav active={view === 'projects'} icon={<LayoutGrid />} label="Projects" onClick={() => setView('projects')} />
+        <Nav active={view === 'retainer'} icon={<Repeat />} label="Retainer" onClick={() => setView('retainer')} />
         <Nav active={view === 'calendar'} icon={<Calendar />} label="Calendar" onClick={() => setView('calendar')} />
         <Nav active={view === 'tasks'} icon={<CheckCircle2 />} label="Tasks" onClick={() => setView('tasks')} />
       </nav>
@@ -1169,6 +1250,37 @@ function Detail({ c, stages, onBack, backLabel, onUpdate, onEdit, onDelete, onAd
 }
 function Info({ label, value }: { label: string; value: any }) { return <div className="info"><span>{label}</span><b>{value || '—'}</b></div> }
 
+// The pending -> active step, shared by the company Project tab and the Retainer sidebar view so
+// the two cannot drift apart. The mutation it calls is the same one PR 2 introduced; only the
+// markup lives here.
+function RecordFirstInvoiceControl({ retainer, onRecord }: { retainer: any; onRecord: (r: any, d: string) => void | Promise<void> }) {
+  const [date, setDate] = useState('')
+  const [saving, setSaving] = useState(false)
+  async function submit() {
+    if (!date) { alert('Pick the date the first invoice was issued.'); return }
+    if (date < retainer.agreement_signed_on) { alert('The first invoice cannot predate the agreement.'); return }
+    setSaving(true)
+    await onRecord(retainer, date)
+    setSaving(false)
+    setDate('')
+  }
+  return (
+    <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+      <input
+        type="date"
+        value={date}
+        min={retainer.agreement_signed_on || undefined}
+        disabled={saving}
+        onChange={e => setDate(e.target.value)}
+        style={{ padding: 8, border: '1px solid var(--line)', background: 'var(--soft)', borderRadius: 9, color: 'var(--text)', fontSize: 12 }}
+      />
+      <button className="primary" onClick={submit} disabled={saving}>
+        {saving ? 'Recording…' : 'Record first invoice'}
+      </button>
+    </div>
+  )
+}
+
 // The conversion gate and the retainer summary, on the company's Project tab.
 //
 // Three states, and the distinction between the first two is the whole point of the design:
@@ -1176,9 +1288,6 @@ function Info({ label, value }: { label: string; value: any }) { return <div cla
 //   - no retainer, at 'Live / Handover'   → offer the action. Arriving here creates NOTHING.
 //   - retainer exists                     → summarise it; if pending, offer the first invoice
 function RetainerBlock({ c, retainer, onConvert, onRecordFirstInvoice }: { c: any; retainer: any; onConvert: (c: any) => void; onRecordFirstInvoice: (r: any, d: string) => void }) {
-  const [invoiceDate, setInvoiceDate] = useState('')
-  const [saving, setSaving] = useState(false)
-
   if (!retainer) {
     const atGate = c.project_stage === RETAINER_GATE_STAGE
     return atGate ? (
@@ -1197,17 +1306,6 @@ function RetainerBlock({ c, retainer, onConvert, onRecordFirstInvoice }: { c: an
     )
   }
 
-  async function submitInvoice() {
-    if (!invoiceDate) { alert('Pick the date the first invoice was issued.'); return }
-    if (invoiceDate < retainer.agreement_signed_on) {
-      alert('The first invoice cannot predate the agreement.'); return
-    }
-    setSaving(true)
-    await onRecordFirstInvoice(retainer, invoiceDate)
-    setSaving(false)
-    setInvoiceDate('')
-  }
-
   return (
     <>
       <Info label="Tier" value={retainer.tier} />
@@ -1220,19 +1318,7 @@ function RetainerBlock({ c, retainer, onConvert, onRecordFirstInvoice }: { c: an
             Signed but not yet invoiced. By SOP this is month 1 — recording the first invoice is
             what starts billing and makes the retainer active.
           </p>
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-            <input
-              type="date"
-              value={invoiceDate}
-              min={retainer.agreement_signed_on || undefined}
-              disabled={saving}
-              onChange={e => setInvoiceDate(e.target.value)}
-              style={{ padding: 8, border: '1px solid var(--line)', background: 'var(--soft)', borderRadius: 9, color: 'var(--text)', fontSize: 12 }}
-            />
-            <button className="primary" onClick={submitInvoice} disabled={saving}>
-              {saving ? 'Recording…' : 'Record first invoice'}
-            </button>
-          </div>
+          <RecordFirstInvoiceControl retainer={retainer} onRecord={onRecordFirstInvoice} />
         </>
       ) : (
         <>
@@ -1671,6 +1757,162 @@ function ProjectsView({ companies, onToggleMilestone, onUpdateProgress, onUpdate
           </div>
         </section>
       )}
+    </>
+  )
+}
+
+// One retainer row. Its own component so the pending invoice control can hold local state
+// without the whole list re-rendering, and so churned rows can render read-only in one place.
+function RetainerCard({ r, companyName, onChangeTier, onPause, onResume, onChurn, onRecordFirstInvoice, onOpenCompany }: any) {
+  const terminal = r.status === 'churned'
+  return (
+    <div className="company-card" style={{ cursor: 'default', alignItems: 'flex-start' }}>
+      <div className="logo-dot big">{initials(companyName)}</div>
+      <div className="cc-main">
+        <div className="cc-title">
+          <h3>{companyName}</h3>
+          <span className="status">{retainerStatusLabels[r.status] || r.status}</span>
+        </div>
+        <p>{r.tier} · agreement signed {fmtDate(r.agreement_signed_on)}</p>
+        <div className="chips">
+          {terminal ? (
+            <span>Churned {fmtDate(r.churned_at)}</span>
+          ) : r.status === 'pending' ? (
+            <span>Awaiting first invoice</span>
+          ) : (
+            <>
+              <span>Anchor {fmtDate(r.billing_anchor)}</span>
+              <span>Next invoice {fmtDate(r.next_invoice_due)}</span>
+            </>
+          )}
+          {/* Case-insensitive by way of goalTemplateFor — retainers.tier is Title Case while the
+              template map is keyed lowercase. A direct index would silently show nothing. */}
+          {goalTemplateFor(r.tier).length > 0 && <span>{goalTemplateFor(r.tier).length} standard goals</span>}
+        </div>
+
+        {!terminal && (
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', marginTop: 10 }}>
+            <select
+              className="outreach-select"
+              style={{ margin: 0, width: 'auto' }}
+              value={r.tier}
+              onChange={e => onChangeTier(r, e.target.value)}
+            >
+              {retainerTierNames.map(t => <option key={t} value={t}>{t}</option>)}
+            </select>
+            {r.status === 'paused'
+              ? <button className="ghost" onClick={() => onResume(r)}>Resume</button>
+              : <button className="ghost" onClick={() => onPause(r)}>Pause</button>}
+            <button className="ghost" onClick={() => onChurn(r)}>Churn</button>
+            <button className="text-btn" onClick={() => onOpenCompany(r.company_id)}>Open company <ArrowUpRight /></button>
+          </div>
+        )}
+        {terminal && (
+          <div style={{ marginTop: 10 }}>
+            <button className="text-btn" onClick={() => onOpenCompany(r.company_id)}>Open company <ArrowUpRight /></button>
+          </div>
+        )}
+
+        {r.status === 'pending' && (
+          <div style={{ marginTop: 10 }}>
+            <RecordFirstInvoiceControl retainer={r} onRecord={onRecordFirstInvoice} />
+          </div>
+        )}
+      </div>
+      <div className="cc-value">
+        <span>Monthly</span>
+        <b>{money(r.monthly_amount)}</b>
+      </div>
+    </div>
+  )
+}
+
+// The Retainer sidebar view. Live engagements come from current_retainers; churned ones arrive in
+// a separate array read with an explicit status filter. The two are never concatenated before the
+// summary is computed, which is what keeps a churned engagement out of the MRR total by
+// construction rather than by remembering to filter.
+function RetainerView({ live, churned, companies, allCompanies, onChangeTier, onPause, onResume, onChurn, onRecordFirstInvoice, onOpenCompany }: any) {
+  const [filter, setFilter] = useState<'live' | 'pending' | 'active' | 'paused' | 'churned'>('live')
+
+  // Names resolve from the full company list so a churned retainer still shows who it belonged to.
+  const nameOf = (id: string) => allCompanies.find((c: any) => c.id === id)?.name || 'Unknown company'
+  // ...while visibility honours the header search, which filters companies, not retainers.
+  const visible = new Set(companies.map((c: any) => c.id))
+
+  // Summary is deliberately computed from `live` only and is NOT narrowed by the search box —
+  // these are business totals, not a count of what is currently on screen.
+  const counts = {
+    active: live.filter((r: any) => r.status === 'active').length,
+    pending: live.filter((r: any) => r.status === 'pending').length,
+    paused: live.filter((r: any) => r.status === 'paused').length,
+  }
+  // Active only. A paused retainer is not billing, and churned rows are not in `live` at all.
+  const mrr = live.filter((r: any) => r.status === 'active')
+    .reduce((sum: number, r: any) => sum + (Number(r.monthly_amount) || 0), 0)
+
+  const source = filter === 'churned' ? churned : live
+  const shown = source
+    .filter((r: any) => (filter === 'live' || filter === 'churned' ? true : r.status === filter))
+    .filter((r: any) => visible.has(r.company_id))
+
+  const tabs: { key: typeof filter; label: string }[] = [
+    { key: 'live', label: 'All live' },
+    { key: 'pending', label: 'Pending' },
+    { key: 'active', label: 'Active' },
+    { key: 'paused', label: 'Paused' },
+    { key: 'churned', label: 'Churned' },
+  ]
+
+  return (
+    <>
+      <div className="page-title">
+        <div>
+          <div className="eyebrow">RECURRING</div>
+          <h1>Retainer.</h1>
+          <p>Clients on an ongoing agreement. Started from a company’s Project tab once delivery is done.</p>
+        </div>
+      </div>
+
+      <div className="metrics">
+        <Metric label="Active" value={counts.active} />
+        <Metric label="Pending first invoice" value={counts.pending} />
+        <Metric label="Paused" value={counts.paused} />
+        <Metric label="MRR (active only)" value={money(mrr)} />
+      </div>
+
+      <div className="filterbar">
+        <span>
+          {shown.length} {shown.length === 1 ? 'retainer' : 'retainers'}
+          {filter === 'churned' ? ' · history, excluded from the totals above' : ''}
+        </span>
+        <div>
+          {tabs.map(t => (
+            <button key={t.key} className={filter === t.key ? 'active' : ''} onClick={() => setFilter(t.key)}>
+              {t.label}{t.key === 'churned' && churned.length ? ` (${churned.length})` : ''}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="company-list">
+        {shown.length ? shown.map((r: any) => (
+          <RetainerCard
+            key={r.id}
+            r={r}
+            companyName={nameOf(r.company_id)}
+            onChangeTier={onChangeTier}
+            onPause={onPause}
+            onResume={onResume}
+            onChurn={onChurn}
+            onRecordFirstInvoice={onRecordFirstInvoice}
+            onOpenCompany={onOpenCompany}
+          />
+        )) : filter === 'churned' ? (
+          <Empty title="No churned retainers" text="Nothing has been churned yet — churning keeps the record, it never deletes it." />
+        ) : (
+          <Empty title="No retainers here" text="Convert a company from its Project tab once it reaches Live / Handover." />
+        )}
+      </div>
     </>
   )
 }
