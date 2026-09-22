@@ -87,6 +87,22 @@ const retainerStatusLabels: Record<string, string> = {
 // action — it creates nothing on its own. A retainer row exists once an agreement date is
 // captured, and goes Active only once a first invoice date is.
 const RETAINER_GATE_STAGE = 'Live / Handover'
+// The recurring retainer cycle, in board order. Unlike Sales and Projects this is a LOOP, not a
+// funnel: '06' hands back to '02' for the next month rather than terminating. The stored value is
+// the whole string including its '01 — ' prefix, so the numbering is part of the data and cannot
+// drift from the order of this array.
+//
+// Feature 1 only READS this, off retainers.cycle_stage. That column does not exist until the
+// retainer-pipeline migration adds it, so until then every live retainer reads as stage 01 — see
+// cycleStageOf(). The board and the advance-to-next-cycle action arrive with that migration.
+const retainerCycleStages = [
+  '01 — Retainer Activated',
+  '02 — Week 1: GBP / Site Health',
+  '03 — Week 2: Website Work',
+  '04 — Week 3: SEO / Performance',
+  '05 — Week 4: Report / Billing',
+  '06 — Month Complete → Next Cycle',
+]
 // Standard recurring goals per tier, taken directly from the Retainer SOP's tier tables —
 // Maintenance has no SOP-mandated recurring deliverable beyond the update allowance itself.
 const retainerGoalTemplates: Record<string, { title: string; cadence: string }[]> = {
@@ -113,6 +129,41 @@ function goalTemplateFor(tier: string | null | undefined) {
   if (!tier) return []
   const key = Object.keys(retainerGoalTemplates).find(k => k.toLowerCase() === tier.toLowerCase())
   return key ? retainerGoalTemplates[key] : []
+}
+
+// Where a retainer currently sits in its monthly cycle. Falls back to stage 01 rather than to
+// "nothing", because a live retainer is always somewhere in the cycle by definition — and before
+// the cycle_stage column exists the field reads undefined on every row, which would otherwise
+// render a stepper with no position at all.
+function cycleStageOf(retainer: any) {
+  const s = retainer?.cycle_stage
+  return retainerCycleStages.includes(s) ? s : retainerCycleStages[0]
+}
+// The stored cycle value carries its own '01 — ' prefix. The stepper already numbers each step
+// from its position, so strip the prefix for display only — the value written back is always the
+// full string.
+function cycleStageLabel(stage: string) {
+  return stage.replace(/^\d+\s*—\s*/, '')
+}
+
+// Which of the three pipelines the company detail page should step through.
+//
+// PRECEDENCE: retainer > project > sales. Not invented here — it is the order RetainerBlock
+// already uses (a live retainer short-circuits the project_stage gate entirely) and the order the
+// boards already imply (Sales hides anything with a project_stage; Home's openCompanies does the
+// same). Reusing it keeps one answer to "what is this company right now" across the whole file.
+//
+// cameFrom is a tiebreaker, never an override of real state:
+//   - 'retainer' with no LIVE retainer means a churned engagement was opened from the Retainer
+//     view's Churned tab. There is no cycle left to step through, so it falls through to the
+//     company's delivery stage rather than rendering an empty retainer stepper.
+//   - 'projects' with no project_stage is reachable from the Tasks/Table modes, which list
+//     milestones for every company including ones still in Sales. Showing the delivery stepper
+//     unset is the useful answer there — it is how delivery gets started.
+function pipelineForCompany(c: any, retainer: any, cameFrom: string) {
+  if (retainer) return 'retainer'
+  if (c.project_stage || cameFrom === 'projects') return 'project'
+  return 'sales'
 }
 
 function money(n: number | null) {
@@ -883,6 +934,7 @@ export default function Page() {
             <Detail
               c={selected}
               stages={stageNames}
+              cameFrom={cameFrom}
               onBack={() => setView(cameFrom)}
               backLabel={cameFrom === 'home' ? 'Today' : cameFrom === 'pipeline' ? 'Sales' : cameFrom === 'projects' ? 'Projects' : cameFrom === 'retainer' ? 'Retainer' : 'Companies'}
               onUpdate={handleStageChange}
@@ -1164,11 +1216,41 @@ function Companies({ companies, onOpen, onNew, onOutreachChange }: { companies: 
   )
 }
 
-function Detail({ c, stages, onBack, backLabel, onUpdate, onEdit, onDelete, onAddActivity, onScheduleMeeting, onSaveNotes, deleting, onOutreachChange, onProjectStageChange, onRetainerTierChange, retainer, onConvertRetainer, onRecordFirstInvoice, onAddMilestone, onToggleMilestone, onApplyTemplate, onUpdateMilestoneProgress, onDeleteMilestone }: { c: any; stages: string[]; onBack: any; backLabel: string; onUpdate: any; onEdit: any; onDelete: any; onAddActivity: any; onScheduleMeeting: any; onSaveNotes: any; deleting?: boolean; onOutreachChange: any; onProjectStageChange: any; onRetainerTierChange: any; retainer: any; onConvertRetainer: any; onRecordFirstInvoice: any; onAddMilestone: any; onToggleMilestone: any; onApplyTemplate: any; onUpdateMilestoneProgress: any; onDeleteMilestone: any }) {
+// The stage stepper at the top of a company page. Markup and class names are lifted verbatim from
+// what Detail rendered inline, so all three pipelines look identical — the only thing that varies
+// is which list of stages is passed in and what a click writes back.
+//
+// `current` may be null (a company with no delivery stage yet): nothing is marked active or done,
+// and every step stays clickable, which is how delivery gets started. Omitting `onSelect` renders
+// the stepper read-only.
+function StageStepper({ stages, current, onSelect, label }: { stages: string[]; current: string | null | undefined; onSelect?: (stage: string) => void; label?: (stage: string) => string }) {
+  const idx = current ? stages.indexOf(current) : -1
+  return (
+    <div className="detail-stage">
+      <div className="stage-line">
+        {stages.map((s, i) => (
+          <div
+            className={current === s ? 'stage active' : idx >= 0 && i < idx ? 'stage done' : 'stage'}
+            key={s}
+            onClick={onSelect ? () => onSelect(s) : undefined}
+            style={onSelect ? { cursor: 'pointer' } : undefined}
+          >
+            <span>{i + 1}</span><small>{label ? label(s) : s}</small>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function Detail({ c, stages, cameFrom, onBack, backLabel, onUpdate, onEdit, onDelete, onAddActivity, onScheduleMeeting, onSaveNotes, deleting, onOutreachChange, onProjectStageChange, onRetainerTierChange, retainer, onConvertRetainer, onRecordFirstInvoice, onAddMilestone, onToggleMilestone, onApplyTemplate, onUpdateMilestoneProgress, onDeleteMilestone }: { c: any; stages: string[]; cameFrom: string; onBack: any; backLabel: string; onUpdate: any; onEdit: any; onDelete: any; onAddActivity: any; onScheduleMeeting: any; onSaveNotes: any; deleting?: boolean; onOutreachChange: any; onProjectStageChange: any; onRetainerTierChange: any; retainer: any; onConvertRetainer: any; onRecordFirstInvoice: any; onAddMilestone: any; onToggleMilestone: any; onApplyTemplate: any; onUpdateMilestoneProgress: any; onDeleteMilestone: any }) {
   const [tab, setTab] = useState('overview')
   const [notes, setNotes] = useState(c.remarks || '')
   useEffect(() => { setNotes(c.remarks || '') }, [c.id])
-  const idx = stages.indexOf(c.lead_status)
+  // Which pipeline this company is actually on. The stepper used to be hardcoded to the sales
+  // stages and c.lead_status no matter where you opened from, so a delivery client or a retainer
+  // client still showed the Sales flow at the top of its own page.
+  const pipeline = pipelineForCompany(c, retainer, cameFrom)
   return (
     <>
       <button className="back" onClick={onBack}>← {backLabel}</button>
@@ -1182,15 +1264,16 @@ function Detail({ c, stages, onBack, backLabel, onUpdate, onEdit, onDelete, onAd
           <button className="icon-btn" onClick={() => onDelete(c.id)} disabled={deleting} title={deleting ? 'Deleting\u2026' : 'Delete'} style={deleting ? { opacity: 0.5, cursor: 'wait' } : undefined}><Trash2 /></button>
         </div>
       </div>
-      <div className="detail-stage">
-        <div className="stage-line">
-          {stages.map((s, i) => (
-            <div className={c.lead_status === s ? 'stage active' : i < idx ? 'stage done' : 'stage'} key={s} onClick={() => onUpdate(c.id, { lead_status: s })} style={{ cursor: 'pointer' }}>
-              <span>{i + 1}</span><small>{s}</small>
-            </div>
-          ))}
-        </div>
-      </div>
+      {pipeline === 'retainer' ? (
+        // Read-only until the retainer-pipeline migration adds cycle_stage and the board that
+        // writes it. Clicking a step here would be asserting a cycle position against a column
+        // that may not exist yet, which is the one thing worse than not offering the control.
+        <StageStepper stages={retainerCycleStages} current={cycleStageOf(retainer)} label={cycleStageLabel} />
+      ) : pipeline === 'project' ? (
+        <StageStepper stages={projectStages} current={c.project_stage} onSelect={s => onProjectStageChange(c.id, s)} />
+      ) : (
+        <StageStepper stages={stages} current={c.lead_status} onSelect={s => onUpdate(c.id, { lead_status: s })} />
+      )}
       <div className="tabs">
         <button className={tab === 'overview' ? 'active' : ''} onClick={() => setTab('overview')}>Overview</button>
         <button className={tab === 'activity' ? 'active' : ''} onClick={() => setTab('activity')}>Activity</button>
