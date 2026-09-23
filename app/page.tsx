@@ -795,6 +795,36 @@ export default function Page() {
     await updateRetainer(r, { status: 'churned', churned_at: todayISO() }, 'Retainer churned')
   }
 
+  // Move an engagement along its monthly cycle. Goes through updateRetainer like every other
+  // retainer write, so it reloads the view and leaves a timeline entry rather than mutating
+  // quietly.
+  //
+  // Only an ACTIVE retainer moves. A pending one is not being delivered against yet, and a paused
+  // one has deliberately stopped — letting either drift through the cycle would put work on the
+  // board that nobody is doing. The guard is here and not only in the UI so a stale card, a
+  // keyboard drag or a future caller cannot get round it.
+  async function updateRetainerCycleStage(retainer: any, cycle_stage: string) {
+    if (retainer.status !== 'active') return
+    if (!retainerCycleStages.includes(cycle_stage)) return
+    if (cycle_stage === cycleStageOf(retainer)) return
+    await updateRetainer(retainer, { cycle_stage },
+      `Retainer cycle → ${cycleStageLabel(cycle_stage)} (month ${retainer.cycle_number || 1})`)
+  }
+
+  // The loop. Stage 06 hands back to stage 02 — Week 1, not to 01, because 'Retainer Activated'
+  // happens once per ENGAGEMENT, not once per month; month 2 starts at week 1.
+  //
+  // Explicit on purpose. Nothing in this codebase runs scheduled jobs, and inferring a rollover
+  // from a date would silently advance clients whose month's work had not actually been done.
+  // cycle_number is what keeps the history: it is incremented here and nowhere else.
+  async function startNextRetainerCycle(retainer: any) {
+    if (retainer.status !== 'active') return
+    const next = (retainer.cycle_number || 1) + 1
+    if (!confirm(`Close month ${retainer.cycle_number || 1} and start month ${next}?\n\nThe retainer goes back to "${cycleStageLabel(retainerCycleStages[1])}" to begin the new cycle. Billing is not affected — that is driven by the invoice dates, not by this.`)) return
+    await updateRetainer(retainer, { cycle_stage: retainerCycleStages[1], cycle_number: next },
+      `Month ${retainer.cycle_number || 1} complete — cycle ${next} started at ${cycleStageLabel(retainerCycleStages[1])}`)
+  }
+
   function patchMilestonesLocally(companyId: string, fn: (ms: any[]) => any[]) {
     setCompanies(x => x.map(c => (c.id === companyId ? { ...c, milestones: fn(c.milestones || []) } : c)))
     setSelected((s: any) => (s && s.id === companyId ? { ...s, milestones: fn(s.milestones || []) } : s))
@@ -1041,6 +1071,8 @@ export default function Page() {
               onChurn={churnRetainer}
               onRecordFirstInvoice={recordFirstInvoice}
               onOpenCompany={(id: string) => { const c = companies.find(z => z.id === id); if (c) openCompany(c, 'retainer') }}
+              onCycleStageChange={updateRetainerCycleStage}
+              onStartNextCycle={startNextRetainerCycle}
             />
           )}
           {view === 'calendar' && <CalendarView meetings={meetings} companies={companies} googleConn={googleConn} onSync={syncGoogleCalendar} onDeleteMeeting={deleteMeeting} onLinkMeeting={linkMeetingToCompany} />}
@@ -1053,6 +1085,7 @@ export default function Page() {
               projectStages={projectStageNames}
               gateStage={retainerGateStage}
               cameFrom={cameFrom}
+              onCycleStageChange={updateRetainerCycleStage}
               onBack={() => setView(cameFrom)}
               backLabel={cameFrom === 'home' ? 'Today' : cameFrom === 'pipeline' ? 'Sales' : cameFrom === 'projects' ? 'Projects' : cameFrom === 'retainer' ? 'Retainer' : 'Companies'}
               onUpdate={handleStageChange}
@@ -1361,7 +1394,7 @@ function StageStepper({ stages, current, onSelect, label }: { stages: string[]; 
   )
 }
 
-function Detail({ c, stages, projectStages, gateStage, cameFrom, onBack, backLabel, onUpdate, onEdit, onDelete, onAddActivity, onScheduleMeeting, onSaveNotes, deleting, onOutreachChange, onProjectStageChange, onRetainerTierChange, retainer, onConvertRetainer, onRecordFirstInvoice, onAddMilestone, onToggleMilestone, onApplyTemplate, onUpdateMilestoneProgress, onDeleteMilestone }: { c: any; stages: string[]; projectStages: string[]; gateStage: string; cameFrom: string; onBack: any; backLabel: string; onUpdate: any; onEdit: any; onDelete: any; onAddActivity: any; onScheduleMeeting: any; onSaveNotes: any; deleting?: boolean; onOutreachChange: any; onProjectStageChange: any; onRetainerTierChange: any; retainer: any; onConvertRetainer: any; onRecordFirstInvoice: any; onAddMilestone: any; onToggleMilestone: any; onApplyTemplate: any; onUpdateMilestoneProgress: any; onDeleteMilestone: any }) {
+function Detail({ c, stages, projectStages, gateStage, cameFrom, onCycleStageChange, onBack, backLabel, onUpdate, onEdit, onDelete, onAddActivity, onScheduleMeeting, onSaveNotes, deleting, onOutreachChange, onProjectStageChange, onRetainerTierChange, retainer, onConvertRetainer, onRecordFirstInvoice, onAddMilestone, onToggleMilestone, onApplyTemplate, onUpdateMilestoneProgress, onDeleteMilestone }: { c: any; stages: string[]; projectStages: string[]; gateStage: string; cameFrom: string; onCycleStageChange: any; onBack: any; backLabel: string; onUpdate: any; onEdit: any; onDelete: any; onAddActivity: any; onScheduleMeeting: any; onSaveNotes: any; deleting?: boolean; onOutreachChange: any; onProjectStageChange: any; onRetainerTierChange: any; retainer: any; onConvertRetainer: any; onRecordFirstInvoice: any; onAddMilestone: any; onToggleMilestone: any; onApplyTemplate: any; onUpdateMilestoneProgress: any; onDeleteMilestone: any }) {
   const [tab, setTab] = useState('overview')
   const [notes, setNotes] = useState(c.remarks || '')
   useEffect(() => { setNotes(c.remarks || '') }, [c.id])
@@ -1383,10 +1416,17 @@ function Detail({ c, stages, projectStages, gateStage, cameFrom, onBack, backLab
         </div>
       </div>
       {pipeline === 'retainer' ? (
-        // Read-only until the retainer-pipeline migration adds cycle_stage and the board that
-        // writes it. Clicking a step here would be asserting a cycle position against a column
-        // that may not exist yet, which is the one thing worse than not offering the control.
-        <StageStepper stages={retainerCycleStages} current={cycleStageOf(retainer)} label={cycleStageLabel} />
+        // Live now that cycle_stage exists. Clickable only while the engagement is ACTIVE — the
+        // same rule the board enforces, for the same reason: a pending or paused retainer is not
+        // being delivered against, so it should not be nudged along the cycle from here either.
+        // Stage 06 is reachable, but rolling over to the next month is deliberately NOT: that
+        // increments cycle_number and belongs to the explicit button on the board.
+        <StageStepper
+          stages={retainerCycleStages}
+          current={cycleStageOf(retainer)}
+          label={cycleStageLabel}
+          onSelect={retainer?.status === 'active' ? (st => onCycleStageChange(retainer, st)) : undefined}
+        />
       ) : pipeline === 'project' ? (
         <StageStepper stages={projectStages} current={c.project_stage} onSelect={s => onProjectStageChange(c.id, s)} />
       ) : (
@@ -2044,8 +2084,12 @@ function RetainerCard({ r, companyName, onChangeTier, onPause, onResume, onChurn
 // a separate array read with an explicit status filter. The two are never concatenated before the
 // summary is computed, which is what keeps a churned engagement out of the MRR total by
 // construction rather than by remembering to filter.
-function RetainerView({ live, churned, companies, allCompanies, onChangeTier, onPause, onResume, onChurn, onRecordFirstInvoice, onOpenCompany }: any) {
+function RetainerView({ live, churned, companies, allCompanies, onChangeTier, onPause, onResume, onChurn, onRecordFirstInvoice, onOpenCompany, onCycleStageChange, onStartNextCycle }: any) {
   const [filter, setFilter] = useState<'live' | 'pending' | 'active' | 'paused' | 'churned'>('live')
+  // Board is the new default view; the status-filtered list it replaces stays available as the
+  // secondary mode, same toggle pattern ProjectsView uses for Clients/Tasks/Table.
+  const [mode, setMode] = useState<'board' | 'list'>('board')
+  const [dragId, setDragId] = useState<string | null>(null)
 
   // Names resolve from the full company list so a churned retainer still shows who it belonged to.
   const nameOf = (id: string) => allCompanies.find((c: any) => c.id === id)?.name || 'Unknown company'
@@ -2067,6 +2111,14 @@ function RetainerView({ live, churned, companies, allCompanies, onChangeTier, on
   const shown = source
     .filter((r: any) => (filter === 'live' || filter === 'churned' ? true : r.status === filter))
     .filter((r: any) => visible.has(r.company_id))
+
+  // What the cycle board shows: every LIVE engagement, honouring the header search exactly as the
+  // list does. Pending and paused rows are included but rendered disabled rather than hidden — a
+  // paused client silently vanishing from the board is the kind of disappearance this app keeps
+  // guarding against, and "here, but not moving, and here is why" is the more honest answer.
+  // Churned rows cannot appear: they are excluded from current_retainers by construction, which
+  // is the whole reason that view exists.
+  const onBoard = live.filter((r: any) => visible.has(r.company_id))
 
   const tabs: { key: typeof filter; label: string }[] = [
     { key: 'live', label: 'All live' },
@@ -2094,19 +2146,83 @@ function RetainerView({ live, churned, companies, allCompanies, onChangeTier, on
       </div>
 
       <div className="filterbar">
-        <span>
-          {shown.length} {shown.length === 1 ? 'retainer' : 'retainers'}
-          {filter === 'churned' ? ' · history, excluded from the totals above' : ''}
-        </span>
-        <div>
+        <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+          <div className="view-toggle">
+            <button className={mode === 'board' ? 'active' : ''} onClick={() => setMode('board')}>Cycle</button>
+            <button className={mode === 'list' ? 'active' : ''} onClick={() => setMode('list')}>List</button>
+          </div>
+          <span>
+            {mode === 'board'
+              ? `${onBoard.length} live · ${counts.active} moving`
+              : `${shown.length} ${shown.length === 1 ? 'retainer' : 'retainers'}${filter === 'churned' ? ' · history, excluded from the totals above' : ''}`}
+          </span>
+        </div>
+        {/* The status tabs belong to the list. The board is the live book by definition — churned
+            engagements are not in `live` at all, so a Churned tab there would always be empty. */}
+        {mode === 'list' && <div>
           {tabs.map(t => (
             <button key={t.key} className={filter === t.key ? 'active' : ''} onClick={() => setFilter(t.key)}>
               {t.label}{t.key === 'churned' && churned.length ? ` (${churned.length})` : ''}
             </button>
           ))}
-        </div>
+        </div>}
       </div>
 
+      {mode === 'board' ? (
+        onBoard.length ? (
+          <div className="kanban">
+            {retainerCycleStages.map(stage => {
+              const items = onBoard.filter((r: any) => cycleStageOf(r) === stage)
+              const isDone = stage === retainerCycleStages[retainerCycleStages.length - 1]
+              return (
+                <div
+                  className="column"
+                  key={stage}
+                  onDragOver={e => e.preventDefault()}
+                  onDrop={e => {
+                    e.preventDefault()
+                    const r = onBoard.find((x: any) => x.id === dragId)
+                    // Dropping on "Month Complete" only parks it there. Rolling over to the next
+                    // cycle is the separate, explicit button below — a drop is too easy to do by
+                    // accident to be allowed to increment cycle_number.
+                    if (r) onCycleStageChange(r, stage)
+                    setDragId(null)
+                  }}
+                >
+                  <div className="col-head"><b>{cycleStageLabel(stage)}</b><span>{items.length}</span></div>
+                  {items.map((r: any) => {
+                    const movable = r.status === 'active'
+                    return (
+                      <div
+                        className="deal-card"
+                        key={r.id}
+                        draggable={movable}
+                        onDragStart={() => movable && setDragId(r.id)}
+                        onDragEnd={() => setDragId(null)}
+                        style={movable ? undefined : { opacity: 0.55, cursor: 'not-allowed' }}
+                        title={movable ? undefined : `${retainerStatusLabels[r.status] || r.status} — only active retainers move through the cycle.`}
+                      >
+                        <div className="card-top"><b>{nameOf(r.company_id)}</b><span>{r.tier}</span></div>
+                        <p>Month {r.cycle_number || 1} · {retainerStatusLabels[r.status] || r.status}</p>
+                        <div className="card-bottom"><span>{money(r.monthly_amount)}</span><span>{fmtDate(r.next_invoice_due)}</span></div>
+                        {isDone && movable && (
+                          <button className="primary" style={{ marginTop: 8, width: '100%' }} onClick={() => onStartNextCycle(r)}>
+                            <Repeat /> Start month {(r.cycle_number || 1) + 1}
+                          </button>
+                        )}
+                        <button className="text-btn" style={{ padding: '4px 0 0', fontSize: 11 }} onClick={() => onOpenCompany(r.company_id)}>
+                          Open company <ArrowUpRight />
+                        </button>
+                      </div>
+                    )
+                  })}
+                  {!items.length && <p style={{ fontSize: 11, color: 'var(--muted)', padding: '8px 2px' }}>Nothing here</p>}
+                </div>
+              )
+            })}
+          </div>
+        ) : <Empty title="No live retainers" text="Convert a company from its Project tab once it reaches the handover stage." />
+      ) : (
       <div className="company-list">
         {shown.length ? shown.map((r: any) => (
           <RetainerCard
@@ -2126,6 +2242,7 @@ function RetainerView({ live, churned, companies, allCompanies, onChangeTier, on
           <Empty title="No retainers here" text="Convert a company from its Project tab once it reaches Live / Handover." />
         )}
       </div>
+      )}
     </>
   )
 }
