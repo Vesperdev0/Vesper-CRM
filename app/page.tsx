@@ -37,20 +37,33 @@ const activityTypes = [
 
 // The real Vesper delivery pipeline, as given by Atomeo (2026-09-08). A company enters at
 // 'Onboarding' automatically when Sales marks it closed-won, and from then on lives on the
-// Projects board instead of the Sales board. Order here is the order of the board columns.
-const projectStages = [
-  'Onboarding',
-  'Sitemap & Wireframe',
-  'Structural Anchors',
-  'Portfolio + Quiz (Premium only)',
-  'Build in Progress',
-  'Full Site Review',
-  'Live Revision Walkthrough',
-  'Final QA',
-  'Launch Prep',
-  'Live / Handover',
-  'Retainer Active / Project Closed',
-]
+// Projects board instead of the Sales board.
+//
+// These stages now live in the project_stages table so they can be renamed/added/reordered from
+// the Projects board, exactly as the sales stages live in pipeline_stages. This list seeds that
+// table on first run and is the fallback if it can't be read.
+//
+// `kind` marks the semantically special columns, same as it does on the sales side. 'gate' is the
+// one that reveals "Convert to Retainer" — read by marker, never by name, so renaming the column
+// cannot silently switch conversion off. See supabase/migrate-project-stages.sql section 4.
+const defaultProjectStageRows: any[] = [
+  { name: 'Onboarding', kind: 'open' },
+  { name: 'Sitemap & Wireframe', kind: 'open' },
+  { name: 'Structural Anchors', kind: 'open' },
+  { name: 'Portfolio + Quiz (Premium only)', kind: 'open' },
+  { name: 'Build in Progress', kind: 'open' },
+  { name: 'Full Site Review', kind: 'open' },
+  { name: 'Live Revision Walkthrough', kind: 'open' },
+  { name: 'Final QA', kind: 'open' },
+  { name: 'Launch Prep', kind: 'open' },
+  { name: 'Live / Handover', kind: 'gate' },
+  { name: 'Retainer Active / Project Closed', kind: 'closed' },
+].map((s, i) => ({ ...s, position: i + 1 }))
+// NOTE: there is deliberately no module-level `projectStages` name list any more. Every consumer
+// now receives the LIVE list (projectStageNames) as a prop. A module const would be a second
+// source of truth that a component forgetting the prop could silently fall back to, showing the
+// original eleven columns on a board that had been edited — the exact drift the milestoneStatuses
+// comment below exists to prevent.
 // The three project board columns, in board order. Both boards and the card status dropdown
 // read this, so a column and its dropdown option can never drift apart.
 const milestoneStatuses: { key: string; label: string }[] = [
@@ -258,11 +271,20 @@ export default function Page() {
   const [deletingId, setDeletingId] = useState<string | null>(null)
   const [aiQuery, setAiQuery] = useState<string | null>(null)
   const [stageRows, setStageRows] = useState<any[]>(defaultStageRows)
+  const [projectStageRows, setProjectStageRows] = useState<any[]>(defaultProjectStageRows)
   const searchRef = useRef<HTMLInputElement>(null)
 
   const stageNames = useMemo(() => stageRows.map(s => s.name), [stageRows])
   const wonStageNames = useMemo(() => stageRows.filter(s => s.kind === 'won').map(s => s.name), [stageRows])
   const closedStageNames = useMemo(() => stageRows.filter(s => s.kind !== 'open').map(s => s.name), [stageRows])
+  const projectStageNames = useMemo(() => projectStageRows.map(s => s.name), [projectStageRows])
+  // The stage that unlocks "Convert to Retainer", resolved by marker rather than by literal so it
+  // survives a rename. Falls back to the original constant when the table hasn't been migrated
+  // yet, or when someone has deleted the gate column outright.
+  const retainerGateStage = useMemo(
+    () => projectStageRows.find(s => s.kind === 'gate')?.name || RETAINER_GATE_STAGE,
+    [projectStageRows]
+  )
 
   function openCompany(c: any, from: string) {
     setSelected(c); setCameFrom(from); setView('detail')
@@ -280,6 +302,21 @@ export default function Page() {
       return
     }
     setStageRows(data)
+  }
+
+  // Exactly loadStages(), against project_stages. Same three cases: table missing → built-in
+  // defaults and editing says so; table empty → seed it once so every row has a real id; else
+  // use what's there.
+  async function loadProjectStages() {
+    const { data, error } = await supabase.from('project_stages').select('*').order('position')
+    if (error) { setProjectStageRows(defaultProjectStageRows); return }
+    if (!data?.length) {
+      const { data: seeded } = await supabase.from('project_stages')
+        .insert(defaultProjectStageRows.map(s => ({ name: s.name, kind: s.kind, position: s.position }))).select()
+      setProjectStageRows(seeded?.length ? [...seeded].sort((a, b) => a.position - b.position) : defaultProjectStageRows)
+      return
+    }
+    setProjectStageRows(data)
   }
 
   async function loadMeetings() {
@@ -338,7 +375,7 @@ export default function Page() {
     ])
     setCompanies((comp || []).map((x: any) => ({ ...x, contact: x.contacts?.[0] || null })))
     setTasks(tk || [])
-    await Promise.all([loadMeetings(), loadGoogleConn(), loadStages(), loadProfile(), loadRetainers()])
+    await Promise.all([loadMeetings(), loadGoogleConn(), loadStages(), loadProjectStages(), loadProfile(), loadRetainers()])
   }
 
   async function syncGoogleCalendar(manual = false) {
@@ -485,12 +522,16 @@ export default function Page() {
   }
   async function handleStageChange(id: string, patch: any) {
     // The Sales → Projects handover: landing on a closed-won stage starts the delivery
-    // pipeline at 'Onboarding', which also removes the company from the Sales board (the
+    // pipeline at its FIRST column, which also removes the company from the Sales board (the
     // Sales view only shows companies without a project_stage). Never overwrites a delivery
     // stage that's already set.
+    //
+    // Reads the live stage list, not the hardcoded one: if the first delivery column has been
+    // renamed or reordered from the board, handover has to land on whatever is actually first
+    // now, or it would drop companies onto a column that no longer exists.
     const company = companies.find(c => c.id === id)
     if (patch.lead_status && wonStageNames.includes(patch.lead_status) && company && !company.project_stage) {
-      patch = { ...patch, project_stage: projectStages[0] }
+      patch = { ...patch, project_stage: projectStageNames[0] }
     }
     const updated = await updateCompany(id, patch)
     if (updated && selected?.id === id) setSelected(updated)
@@ -559,6 +600,81 @@ export default function Page() {
     const err = r1.error || r2.error
     if (err) { alert(err.message); await loadStages(); return }
     await loadStages()
+  }
+
+  // ---------------------------------------------------------------- project stage CRUD
+  // Deliberately line-for-line with the four sales functions above, against project_stages and
+  // companies.project_stage. The only substantive differences are noted where they occur.
+
+  async function renameProjectStage(stage: any) {
+    const name = prompt('Rename delivery stage', stage.name)?.trim()
+    if (!name || name === stage.name) return
+    if (projectStageRows.some(s => s.name === name)) { alert('A delivery stage with that name already exists.'); return }
+    if (!stage.id) { alert('Run supabase/migrate-project-stages.sql first — delivery stages are still the built-in defaults.'); return }
+    const { error } = await supabase.from('project_stages').update({ name }).eq('id', stage.id)
+    if (error) { alert(error.message); return }
+    // Companies carry the stage by name, so move them along with the rename. This is the write
+    // that companies_project_stage_check used to reject outright — see the migration's section 2.
+    const { error: cErr } = await supabase.from('companies').update({ project_stage: name }).eq('project_stage', stage.name)
+    if (cErr) { alert(cErr.message); return }
+    setProjectStageRows(x => x.map(s => (s.id === stage.id ? { ...s, name } : s)))
+    setCompanies(x => x.map(c => (c.project_stage === stage.name ? { ...c, project_stage: name } : c)))
+    setSelected((s: any) => (s && s.project_stage === stage.name ? { ...s, project_stage: name } : s))
+  }
+
+  async function addProjectStage() {
+    const name = prompt('New delivery stage name')?.trim()
+    if (!name) return
+    if (projectStageRows.some(s => s.name === name)) { alert('That delivery stage already exists.'); return }
+    if (!projectStageRows.some(s => s.id)) { alert('Run supabase/migrate-project-stages.sql first — delivery stages are still the built-in defaults.'); return }
+    // New stages slot in before the terminal columns (the gate and the closed column stay at the end).
+    const firstClosed = [...projectStageRows].filter(s => s.kind !== 'open').sort((a, b) => a.position - b.position)[0]
+    const position = firstClosed ? firstClosed.position : Math.max(0, ...projectStageRows.map(s => s.position || 0)) + 1
+    if (firstClosed) {
+      await Promise.all(projectStageRows.filter(s => s.position >= position && s.id).map(s =>
+        supabase.from('project_stages').update({ position: s.position + 1 }).eq('id', s.id)
+      ))
+    }
+    const { error } = await supabase.from('project_stages').insert({ name, kind: 'open', position })
+    if (error) { alert(error.message); return }
+    await loadProjectStages()
+  }
+
+  // Same protection as deleteStage: refuses while companies still sit on the column rather than
+  // orphaning them on a project_stage no column renders, which would make those rows vanish from
+  // the Projects board entirely.
+  async function deleteProjectStage(stage: any) {
+    if (!stage.id) { alert('Run supabase/migrate-project-stages.sql first — delivery stages are still the built-in defaults.'); return }
+    const occupants = companies.filter(c => c.project_stage === stage.name).length
+    if (occupants) { alert(`"${stage.name}" still has ${occupants} ${occupants === 1 ? 'client' : 'clients'}. Move them to another stage first.`); return }
+    // Not in the sales original, and needed here: deleting the gate would leave nothing marked
+    // 'gate', so retainerGateStage would fall back to a stage name that no longer exists and
+    // "Convert to Retainer" would never appear again — with no error to explain why. Rename it
+    // instead; the marker travels with the row.
+    if (stage.kind === 'gate') { alert(`"${stage.name}" is the stage that unlocks Convert to Retainer. Rename it if you need different wording, but it cannot be deleted.`); return }
+    if (projectStageRows.filter(x => x.kind === 'open').length <= 1 && stage.kind === 'open') { alert('Keep at least one open delivery stage.'); return }
+    if (!confirm(`Delete the "${stage.name}" delivery stage? This cannot be undone.`)) return
+    const { error } = await supabase.from('project_stages').delete().eq('id', stage.id)
+    if (error) { alert(error.message); return }
+    await loadProjectStages()
+  }
+
+  // Swaps this stage's position with its neighbour in the given direction.
+  async function moveProjectStage(stage: any, dir: -1 | 1) {
+    if (!stage.id) { alert('Run supabase/migrate-project-stages.sql first — delivery stages are still the built-in defaults.'); return }
+    const ordered = [...projectStageRows].sort((a, b) => a.position - b.position)
+    const i = ordered.findIndex(x => x.id === stage.id)
+    const j = i + dir
+    if (i < 0 || j < 0 || j >= ordered.length) return
+    const other = ordered[j]
+    const [a, b] = [stage.position, other.position]
+    const [r1, r2] = await Promise.all([
+      supabase.from('project_stages').update({ position: b }).eq('id', stage.id),
+      supabase.from('project_stages').update({ position: a }).eq('id', other.id),
+    ])
+    const err = r1.error || r2.error
+    if (err) { alert(err.message); await loadProjectStages(); return }
+    await loadProjectStages()
   }
 
   async function handleSaveNotes(id: string, remarks: string) {
@@ -752,7 +868,7 @@ export default function Page() {
     // Same handover rule as handleStageChange, for closes made through the edit form.
     const existing = companies.find(z => z.id === id)
     const handover = wonStageNames.includes(c.lead_status) && existing && !existing.project_stage
-      ? { project_stage: projectStages[0] } : {}
+      ? { project_stage: projectStageNames[0] } : {}
     const { error } = await supabase.from('companies').update({
       ...handover,
       name: c.name, lead_status: c.lead_status, lead_score: c.lead_score, website: c.website,
@@ -912,7 +1028,7 @@ export default function Page() {
           {view === 'home' && <HomeView companies={companies} meetings={meetings} closedStages={closedStageNames} onOpen={(c: any) => { openCompany(c, 'home') }} onNew={() => setShowNew(true)} onGoCalendar={() => setView('calendar')} onDeleteMeeting={deleteMeeting} onLinkMeeting={linkMeetingToCompany} />}
           {view === 'pipeline' && <Pipeline companies={filtered.filter((c: any) => !c.project_stage)} stages={stageRows} onOpen={(c: any) => { openCompany(c, 'pipeline') }} onUpdate={handleStageChange} onOutreachChange={updateOutreachStatus} onRenameStage={renameStage} onAddStage={addStage} onDeleteStage={deleteStage} onMoveStage={moveStage} />}
           {view === 'companies' && <Companies companies={aiResult?.matches ?? filtered} onOpen={(c: any) => { openCompany(c, 'companies') }} onNew={() => setShowNew(true)} onOutreachChange={updateOutreachStatus} />}
-          {view === 'projects' && <ProjectsView companies={filtered} onToggleMilestone={toggleMilestone} onUpdateProgress={updateMilestoneProgress} onUpdateFields={updateMilestoneFields} onDeleteMilestone={deleteMilestone} onProjectStageChange={updateProjectStage} onOpenCompany={(c: any) => { openCompany(c, 'projects') }} />}
+          {view === 'projects' && <ProjectsView companies={filtered} stages={projectStageRows} onToggleMilestone={toggleMilestone} onUpdateProgress={updateMilestoneProgress} onUpdateFields={updateMilestoneFields} onDeleteMilestone={deleteMilestone} onProjectStageChange={updateProjectStage} onOpenCompany={(c: any) => { openCompany(c, 'projects') }} onRenameStage={renameProjectStage} onAddStage={addProjectStage} onDeleteStage={deleteProjectStage} onMoveStage={moveProjectStage} />}
           {view === 'retainer' && (
             <RetainerView
               live={liveRetainers}
@@ -934,6 +1050,8 @@ export default function Page() {
             <Detail
               c={selected}
               stages={stageNames}
+              projectStages={projectStageNames}
+              gateStage={retainerGateStage}
               cameFrom={cameFrom}
               onBack={() => setView(cameFrom)}
               backLabel={cameFrom === 'home' ? 'Today' : cameFrom === 'pipeline' ? 'Sales' : cameFrom === 'projects' ? 'Projects' : cameFrom === 'retainer' ? 'Retainer' : 'Companies'}
@@ -1243,7 +1361,7 @@ function StageStepper({ stages, current, onSelect, label }: { stages: string[]; 
   )
 }
 
-function Detail({ c, stages, cameFrom, onBack, backLabel, onUpdate, onEdit, onDelete, onAddActivity, onScheduleMeeting, onSaveNotes, deleting, onOutreachChange, onProjectStageChange, onRetainerTierChange, retainer, onConvertRetainer, onRecordFirstInvoice, onAddMilestone, onToggleMilestone, onApplyTemplate, onUpdateMilestoneProgress, onDeleteMilestone }: { c: any; stages: string[]; cameFrom: string; onBack: any; backLabel: string; onUpdate: any; onEdit: any; onDelete: any; onAddActivity: any; onScheduleMeeting: any; onSaveNotes: any; deleting?: boolean; onOutreachChange: any; onProjectStageChange: any; onRetainerTierChange: any; retainer: any; onConvertRetainer: any; onRecordFirstInvoice: any; onAddMilestone: any; onToggleMilestone: any; onApplyTemplate: any; onUpdateMilestoneProgress: any; onDeleteMilestone: any }) {
+function Detail({ c, stages, projectStages, gateStage, cameFrom, onBack, backLabel, onUpdate, onEdit, onDelete, onAddActivity, onScheduleMeeting, onSaveNotes, deleting, onOutreachChange, onProjectStageChange, onRetainerTierChange, retainer, onConvertRetainer, onRecordFirstInvoice, onAddMilestone, onToggleMilestone, onApplyTemplate, onUpdateMilestoneProgress, onDeleteMilestone }: { c: any; stages: string[]; projectStages: string[]; gateStage: string; cameFrom: string; onBack: any; backLabel: string; onUpdate: any; onEdit: any; onDelete: any; onAddActivity: any; onScheduleMeeting: any; onSaveNotes: any; deleting?: boolean; onOutreachChange: any; onProjectStageChange: any; onRetainerTierChange: any; retainer: any; onConvertRetainer: any; onRecordFirstInvoice: any; onAddMilestone: any; onToggleMilestone: any; onApplyTemplate: any; onUpdateMilestoneProgress: any; onDeleteMilestone: any }) {
   const [tab, setTab] = useState('overview')
   const [notes, setNotes] = useState(c.remarks || '')
   useEffect(() => { setNotes(c.remarks || '') }, [c.id])
@@ -1312,6 +1430,8 @@ function Detail({ c, stages, cameFrom, onBack, backLabel, onUpdate, onEdit, onDe
         <ProjectPanel
           c={c}
           retainer={retainer}
+          projectStages={projectStages}
+          gateStage={gateStage}
           onConvertRetainer={onConvertRetainer}
           onRecordFirstInvoice={onRecordFirstInvoice}
           onStageChange={onProjectStageChange}
@@ -1370,9 +1490,9 @@ function RecordFirstInvoiceControl({ retainer, onRecord }: { retainer: any; onRe
 //   - no retainer, not at the gate stage  → explain what unlocks it, offer nothing
 //   - no retainer, at 'Live / Handover'   → offer the action. Arriving here creates NOTHING.
 //   - retainer exists                     → summarise it; if pending, offer the first invoice
-function RetainerBlock({ c, retainer, onConvert, onRecordFirstInvoice }: { c: any; retainer: any; onConvert: (c: any) => void; onRecordFirstInvoice: (r: any, d: string) => void }) {
+function RetainerBlock({ c, retainer, gateStage, onConvert, onRecordFirstInvoice }: { c: any; retainer: any; gateStage: string; onConvert: (c: any) => void; onRecordFirstInvoice: (r: any, d: string) => void }) {
   if (!retainer) {
-    const atGate = c.project_stage === RETAINER_GATE_STAGE
+    const atGate = c.project_stage === gateStage
     return atGate ? (
       <>
         <p style={{ fontSize: 11, color: 'var(--muted)', margin: '0 0 10px' }}>
@@ -1383,7 +1503,7 @@ function RetainerBlock({ c, retainer, onConvert, onRecordFirstInvoice }: { c: an
       </>
     ) : (
       <p style={{ fontSize: 11, color: 'var(--muted)', margin: 0 }}>
-        Available once this company reaches <b>{RETAINER_GATE_STAGE}</b>. Never straight from Sales
+        Available once this company reaches <b>{gateStage}</b>. Never straight from Sales
         — the project has to be delivered first.
       </p>
     )
@@ -1414,7 +1534,7 @@ function RetainerBlock({ c, retainer, onConvert, onRecordFirstInvoice }: { c: an
   )
 }
 
-function ProjectPanel({ c, retainer, onConvertRetainer, onRecordFirstInvoice, onStageChange, onTierChange, onAddMilestone, onToggleMilestone, onApplyTemplate, onUpdateProgress, onDeleteMilestone }: { c: any; retainer: any; onConvertRetainer: (c: any) => void; onRecordFirstInvoice: (r: any, d: string) => void; onStageChange: (id: string, stage: string) => void; onTierChange: (id: string, tier: string) => void; onAddMilestone: (c: any, m: any) => void; onToggleMilestone: (companyId: string, milestoneId: string, status: string) => void; onApplyTemplate: (c: any, tier: string) => void; onUpdateProgress: (companyId: string, milestoneId: string, progress: number) => void; onDeleteMilestone: (companyId: string, milestoneId: string) => void }) {
+function ProjectPanel({ c, retainer, projectStages, gateStage, onConvertRetainer, onRecordFirstInvoice, onStageChange, onTierChange, onAddMilestone, onToggleMilestone, onApplyTemplate, onUpdateProgress, onDeleteMilestone }: { c: any; retainer: any; projectStages: string[]; gateStage: string; onConvertRetainer: (c: any) => void; onRecordFirstInvoice: (r: any, d: string) => void; onStageChange: (id: string, stage: string) => void; onTierChange: (id: string, tier: string) => void; onAddMilestone: (c: any, m: any) => void; onToggleMilestone: (companyId: string, milestoneId: string, status: string) => void; onApplyTemplate: (c: any, tier: string) => void; onUpdateProgress: (companyId: string, milestoneId: string, progress: number) => void; onDeleteMilestone: (companyId: string, milestoneId: string) => void }) {
   const [title, setTitle] = useState('')
   const [cadence, setCadence] = useState('once')
   const [category, setCategory] = useState('goal')
@@ -1451,6 +1571,7 @@ function ProjectPanel({ c, retainer, onConvertRetainer, onRecordFirstInvoice, on
           <RetainerBlock
             c={c}
             retainer={retainer}
+            gateStage={gateStage}
             onConvert={onConvertRetainer}
             onRecordFirstInvoice={onRecordFirstInvoice}
           />
@@ -1658,7 +1779,7 @@ function Tasks({ tasks, companies, onToggle, onAdd, onDelete }: { tasks: any[]; 
   )
 }
 
-function ProjectsView({ companies, onToggleMilestone, onUpdateProgress, onUpdateFields, onDeleteMilestone, onProjectStageChange, onOpenCompany }: { companies: any[]; onToggleMilestone: any; onUpdateProgress: any; onUpdateFields: any; onDeleteMilestone: any; onProjectStageChange: any; onOpenCompany: any }) {
+function ProjectsView({ companies, stages, onToggleMilestone, onUpdateProgress, onUpdateFields, onDeleteMilestone, onProjectStageChange, onOpenCompany, onRenameStage, onAddStage, onDeleteStage, onMoveStage }: { companies: any[]; stages: any[]; onToggleMilestone: any; onUpdateProgress: any; onUpdateFields: any; onDeleteMilestone: any; onProjectStageChange: any; onOpenCompany: any; onRenameStage: any; onAddStage: any; onDeleteStage: any; onMoveStage: any }) {
   const [mode, setMode] = useState<'clients' | 'board' | 'table'>('clients')
   const [dragC, setDragC] = useState<string | null>(null)
   const clients = companies.filter((c: any) => c.project_stage)
@@ -1711,12 +1832,19 @@ function ProjectsView({ companies, onToggleMilestone, onUpdateProgress, onUpdate
       {mode === 'clients' ? (
         clients.length ? (
           <div className="kanban">
-            {projectStages.map((stage) => {
-              const items = clients.filter((c: any) => c.project_stage === stage)
-              return (
+            {stages.map((s: any) => { const stage = s.name; return (
                 <div className="column" key={stage} onDragOver={e => e.preventDefault()} onDrop={e => { e.preventDefault(); if (dragC) onProjectStageChange(dragC, stage); setDragC(null) }}>
-                  <div className="col-head"><b>{stage}</b><span>{items.length}</span></div>
-                  {items.map((c: any) => {
+                  <div className="col-head">
+                    <b>{stage}</b>
+                    <span className="col-tools">
+                      <button className="col-edit" title="Move left" onClick={() => onMoveStage(s, -1)}>‹</button>
+                      <button className="col-edit" title="Move right" onClick={() => onMoveStage(s, 1)}>›</button>
+                      <button className="col-edit" title="Rename stage" onClick={() => onRenameStage(s)}><Pencil /></button>
+                      <button className="col-edit" title="Delete stage" onClick={() => onDeleteStage(s)}><Trash2 /></button>
+                      {clients.filter((c: any) => c.project_stage === stage).length}
+                    </span>
+                  </div>
+                  {clients.filter((c: any) => c.project_stage === stage).map((c: any) => {
                     const ms = c.milestones || []
                     const done = ms.filter((m: any) => m.status === 'done').length
                     const avg = ms.length ? Math.round(ms.reduce((s: number, m: any) => s + (m.progress ?? 0), 0) / ms.length) : 0
@@ -1729,8 +1857,10 @@ function ProjectsView({ companies, onToggleMilestone, onUpdateProgress, onUpdate
                     )
                   })}
                 </div>
-              )
-            })}
+            )})}
+            <div className="column">
+              <button className="ghost add-stage" onClick={onAddStage}><Plus /> Add stage</button>
+            </div>
           </div>
         ) : <Empty title="No clients in delivery yet" text="Close a deal on the Sales board and the company lands here automatically." />
       ) : !all.length ? (
