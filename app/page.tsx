@@ -179,6 +179,30 @@ function pipelineForCompany(c: any, retainer: any, cameFrom: string) {
   return 'sales'
 }
 
+// THE MRR calculation, and the only one. It lived inline in RetainerView; Home needs the same
+// number, and a revenue formula written out twice is a formula free to drift — one place gets a
+// filter fixed and the other quietly keeps reporting the old total.
+//
+// Active only, and `live` must come from current_retainers: a paused retainer is not billing, and
+// churned rows are excluded from that view by construction.
+function retainerMRR(live: any[]) {
+  return live.filter((r: any) => r.status === 'active')
+    .reduce((sum: number, r: any) => sum + (Number(r.monthly_amount) || 0), 0)
+}
+function countByStatus(live: any[], status: string) {
+  return live.filter((r: any) => r.status === status).length
+}
+// Open = anything not done. 'missed' is deliberately included: a milestone that slipped its date
+// is still outstanding work, and the Projects table can set that status directly.
+//
+// NOTE: `priority` exists ONLY on milestones (Low/Medium/High). The generic `tasks` table — the
+// follow-up reminders on the Tasks view — has no priority column at all, so "high priority tasks"
+// can only mean delivery milestones. See the PR description.
+function highPriorityOpenMilestones(companies: any[]) {
+  return companies.flatMap((c: any) => c.milestones || [])
+    .filter((m: any) => m.status !== 'done' && m.priority === 'High').length
+}
+
 function money(n: number | null) {
   return n == null ? '—' : new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 }).format(n)
 }
@@ -272,6 +296,10 @@ export default function Page() {
   const [aiQuery, setAiQuery] = useState<string | null>(null)
   const [stageRows, setStageRows] = useState<any[]>(defaultStageRows)
   const [projectStageRows, setProjectStageRows] = useState<any[]>(defaultProjectStageRows)
+  // Set when Home's high-priority card is clicked, so Projects opens straight onto the table
+  // already filtered. ProjectsView reads it as initial state and clears it on mount, so coming
+  // back to Projects through the nav later gets the normal unfiltered view.
+  const [projectsPreset, setProjectsPreset] = useState<any>(null)
   const searchRef = useRef<HTMLInputElement>(null)
 
   const stageNames = useMemo(() => stageRows.map(s => s.name), [stageRows])
@@ -1055,10 +1083,10 @@ export default function Page() {
           </div>
         </header>
         <div className="content">
-          {view === 'home' && <HomeView companies={companies} meetings={meetings} closedStages={closedStageNames} onOpen={(c: any) => { openCompany(c, 'home') }} onNew={() => setShowNew(true)} onGoCalendar={() => setView('calendar')} onDeleteMeeting={deleteMeeting} onLinkMeeting={linkMeetingToCompany} />}
+          {view === 'home' && <HomeView companies={companies} meetings={meetings} closedStages={closedStageNames} retainers={liveRetainers} projectStages={projectStageRows} onOpen={(c: any) => { openCompany(c, 'home') }} onNew={() => setShowNew(true)} onGoCalendar={() => setView('calendar')} onDeleteMeeting={deleteMeeting} onLinkMeeting={linkMeetingToCompany} onGoHighPriority={() => { setProjectsPreset({ mode: 'table', priority: 'High' }); setView('projects') }} />}
           {view === 'pipeline' && <Pipeline companies={filtered.filter((c: any) => !c.project_stage)} stages={stageRows} onOpen={(c: any) => { openCompany(c, 'pipeline') }} onUpdate={handleStageChange} onOutreachChange={updateOutreachStatus} onRenameStage={renameStage} onAddStage={addStage} onDeleteStage={deleteStage} onMoveStage={moveStage} />}
           {view === 'companies' && <Companies companies={aiResult?.matches ?? filtered} onOpen={(c: any) => { openCompany(c, 'companies') }} onNew={() => setShowNew(true)} onOutreachChange={updateOutreachStatus} />}
-          {view === 'projects' && <ProjectsView companies={filtered} stages={projectStageRows} onToggleMilestone={toggleMilestone} onUpdateProgress={updateMilestoneProgress} onUpdateFields={updateMilestoneFields} onDeleteMilestone={deleteMilestone} onProjectStageChange={updateProjectStage} onOpenCompany={(c: any) => { openCompany(c, 'projects') }} onRenameStage={renameProjectStage} onAddStage={addProjectStage} onDeleteStage={deleteProjectStage} onMoveStage={moveProjectStage} />}
+          {view === 'projects' && <ProjectsView companies={filtered} stages={projectStageRows} preset={projectsPreset} onConsumePreset={() => setProjectsPreset(null)} onToggleMilestone={toggleMilestone} onUpdateProgress={updateMilestoneProgress} onUpdateFields={updateMilestoneFields} onDeleteMilestone={deleteMilestone} onProjectStageChange={updateProjectStage} onOpenCompany={(c: any) => { openCompany(c, 'projects') }} onRenameStage={renameProjectStage} onAddStage={addProjectStage} onDeleteStage={deleteProjectStage} onMoveStage={moveProjectStage} />}
           {view === 'retainer' && (
             <RetainerView
               live={liveRetainers}
@@ -1141,7 +1169,7 @@ function Nav({ active, icon, label, onClick }: { active: boolean; icon: any; lab
   return <button className={active ? 'nav active' : 'nav'} onClick={onClick}>{icon}<span>{label}</span></button>
 }
 
-function HomeView({ companies, meetings, closedStages, onOpen, onNew, onGoCalendar, onDeleteMeeting, onLinkMeeting }: { companies: any[]; meetings: any[]; closedStages: string[]; onOpen: any; onNew: any; onGoCalendar: any; onDeleteMeeting: any; onLinkMeeting: any }) {
+function HomeView({ companies, meetings, closedStages, retainers, projectStages, onOpen, onNew, onGoCalendar, onDeleteMeeting, onLinkMeeting, onGoHighPriority }: { companies: any[]; meetings: any[]; closedStages: string[]; retainers: any[]; projectStages: any[]; onOpen: any; onNew: any; onGoCalendar: any; onDeleteMeeting: any; onLinkMeeting: any; onGoHighPriority: any }) {
   const upcoming = meetings.filter(m => new Date(m.starts_at) >= new Date(Date.now() - 3600000)).sort((a, b) => a.starts_at.localeCompare(b.starts_at))
   const qualified = companies.filter(c => c.lead_status === 'Qualified Lead').length
   // Both top-line numbers used to run over `companies` unfiltered, so a lost deal and a client
@@ -1165,14 +1193,49 @@ function HomeView({ companies, meetings, closedStages, onOpen, onNew, onGoCalend
     .sort((a, b) => (b.daysSinceTouch ?? 9999) - (a.daysSinceTouch ?? 9999))
     .slice(0, 4)
 
+  // ---- Delivery. Home reported nothing at all about Projects or Retainer: openCompanies above
+  // explicitly EXCLUDES anything that has moved into delivery, so a company handed over simply
+  // stopped being counted anywhere on this page.
+  //
+  // The breakdown is driven by project_stages.kind, never by stage NAME. Stage names are editable
+  // from the Projects board now, so a hardcoded 'Build in Progress' here would start reporting
+  // zero the first time somebody renamed a column — silently, since a count of 0 looks like an
+  // answer rather than a bug.
+  const inDelivery = companies.filter(c => c.project_stage)
+  const kindOfStage = (name: string) => projectStages.find((s: any) => s.name === name)?.kind || 'open'
+  const inBuild = inDelivery.filter(c => kindOfStage(c.project_stage) === 'open').length
+  const atHandover = inDelivery.filter(c => kindOfStage(c.project_stage) === 'gate').length
+  const highPriority = highPriorityOpenMilestones(companies)
+
+  // ---- Recurring. Same numbers the Retainer view shows, from the same functions, so the two
+  // pages cannot disagree about what MRR is.
+  const activeRetainers = countByStatus(retainers, 'active')
+  const mrr = retainerMRR(retainers)
+
   return (
     <>
       <div className="page-title"><div><div className="eyebrow">OUTREACH CRM</div><h1>Good morning.</h1><p>Here’s what needs your attention.</p></div><button className="ghost" onClick={onNew}><Plus /> Add prospect</button></div>
+      {/* The original four, untouched — same component, same order, same classes. The label above
+          them is the only addition, so the three pipelines read as three groups rather than one
+          undifferentiated row of ten. */}
+      <div className="eyebrow">SALES</div>
       <div className="metrics">
         <Metric label="Open prospects" value={openCompanies.length} />
         <Metric label="Qualified leads" value={qualified} />
         <Metric label="Meetings" value={upcoming.length} />
         <Metric label="Open pipeline value" value={money(openValue)} />
+      </div>
+      <div className="eyebrow" style={{ marginTop: 20 }}>DELIVERY</div>
+      <div className="metrics">
+        <Metric label="In delivery" value={inDelivery.length} />
+        <Metric label="In build" value={inBuild} />
+        <Metric label="At handover" value={atHandover} />
+        <Metric label="High-priority tasks open" value={highPriority} onClick={onGoHighPriority} />
+      </div>
+      <div className="eyebrow" style={{ marginTop: 20 }}>RECURRING</div>
+      <div className="metrics">
+        <Metric label="Active retainers" value={activeRetainers} />
+        <Metric label="MRR (active only)" value={money(mrr)} />
       </div>
       <div className="grid2">
         <section className="panel">
@@ -1276,7 +1339,11 @@ function MeetingCompanyPicker({ meeting, companies, onLink, compact }: { meeting
   )
 }
 
-function Metric({ label, value }: { label: string; value: any }) { return <div className="metric"><span>{label}</span><strong>{value}</strong></div> }
+// onClick is optional and changes nothing visually when absent — the markup and classes are
+// exactly as before, so every existing Metric renders identically.
+function Metric({ label, value, onClick }: { label: string; value: any; onClick?: () => void }) {
+  return <div className="metric" onClick={onClick} style={onClick ? { cursor: 'pointer' } : undefined}><span>{label}</span><strong>{value}</strong></div>
+}
 function Attention({ icon, title, text, onClick }: { icon: any; title: string; text: string; onClick?: () => void }) {
   return <div className="attention" onClick={onClick} style={onClick ? { cursor: 'pointer' } : undefined}>{icon}<div><b>{title}</b><p>{text}</p></div></div>
 }
@@ -1819,14 +1886,20 @@ function Tasks({ tasks, companies, onToggle, onAdd, onDelete }: { tasks: any[]; 
   )
 }
 
-function ProjectsView({ companies, stages, onToggleMilestone, onUpdateProgress, onUpdateFields, onDeleteMilestone, onProjectStageChange, onOpenCompany, onRenameStage, onAddStage, onDeleteStage, onMoveStage }: { companies: any[]; stages: any[]; onToggleMilestone: any; onUpdateProgress: any; onUpdateFields: any; onDeleteMilestone: any; onProjectStageChange: any; onOpenCompany: any; onRenameStage: any; onAddStage: any; onDeleteStage: any; onMoveStage: any }) {
-  const [mode, setMode] = useState<'clients' | 'board' | 'table'>('clients')
+function ProjectsView({ companies, stages, preset, onConsumePreset, onToggleMilestone, onUpdateProgress, onUpdateFields, onDeleteMilestone, onProjectStageChange, onOpenCompany, onRenameStage, onAddStage, onDeleteStage, onMoveStage }: { companies: any[]; stages: any[]; preset?: any; onConsumePreset?: any; onToggleMilestone: any; onUpdateProgress: any; onUpdateFields: any; onDeleteMilestone: any; onProjectStageChange: any; onOpenCompany: any; onRenameStage: any; onAddStage: any; onDeleteStage: any; onMoveStage: any }) {
+  // ProjectsView is conditionally rendered, so it remounts on every navigation here — which
+  // makes the preset plain initial state rather than something to sync in an effect. It is
+  // cleared on mount so the filter applies to this arrival only and does not stick.
+  const [mode, setMode] = useState<'clients' | 'board' | 'table'>(preset?.mode || 'clients')
   const [dragC, setDragC] = useState<string | null>(null)
   const clients = companies.filter((c: any) => c.project_stage)
   const [statusFilter, setStatusFilter] = useState('all')
-  const [priorityFilter, setPriorityFilter] = useState('all')
+  const [priorityFilter, setPriorityFilter] = useState(preset?.priority || 'all')
   const [companyFilter, setCompanyFilter] = useState('all')
   const [drag, setDrag] = useState<{ id: string; companyId: string } | null>(null)
+  // Consume the preset once it has seeded the state above. Empty deps on purpose: this fires on
+  // mount only, which is exactly when the initial state was taken from it.
+  useEffect(() => { if (preset) onConsumePreset?.() }, [])
   const bucketOf = bucketOfMilestone
   const all = companies.flatMap((c: any) => (c.milestones || []).map((m: any) => ({ ...m, companyName: c.name, companyId: c.id })))
   const withTasks = companies.filter((c: any) => (c.milestones || []).length)
@@ -2099,13 +2172,12 @@ function RetainerView({ live, churned, companies, allCompanies, onChangeTier, on
   // Summary is deliberately computed from `live` only and is NOT narrowed by the search box —
   // these are business totals, not a count of what is currently on screen.
   const counts = {
-    active: live.filter((r: any) => r.status === 'active').length,
-    pending: live.filter((r: any) => r.status === 'pending').length,
-    paused: live.filter((r: any) => r.status === 'paused').length,
+    active: countByStatus(live, 'active'),
+    pending: countByStatus(live, 'pending'),
+    paused: countByStatus(live, 'paused'),
   }
-  // Active only. A paused retainer is not billing, and churned rows are not in `live` at all.
-  const mrr = live.filter((r: any) => r.status === 'active')
-    .reduce((sum: number, r: any) => sum + (Number(r.monthly_amount) || 0), 0)
+  // Shared with Home via retainerMRR() — see its comment for why this is not inlined here.
+  const mrr = retainerMRR(live)
 
   const source = filter === 'churned' ? churned : live
   const shown = source
